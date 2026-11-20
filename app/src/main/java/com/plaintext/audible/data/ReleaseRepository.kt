@@ -83,6 +83,7 @@ data class FilterPrefs(
     val enableDirectAdd: Boolean = false,
     val alwaysShowCardActions: Boolean = false,
     val checkAbbDaily: Boolean = true,
+    val hideCoverArt: Boolean = false,
     val themeModeCode: String = "SYSTEM",
     val notifyHour: Int = 9,
     val notifyMinute: Int = 0,
@@ -121,6 +122,7 @@ class ReleaseRepository(context: Context) {
         enableDirectAdd = prefs.getBoolean("enable_direct_add", false),
         alwaysShowCardActions = prefs.getBoolean("always_show_card_actions", false),
         checkAbbDaily = prefs.getBoolean("check_abb_daily", true),
+        hideCoverArt = prefs.getBoolean("hide_cover_art", false),
         themeModeCode = prefs.getString("theme_mode", "SYSTEM") ?: "SYSTEM",
         notifyHour = prefs.getInt("notify_hour", 9),
         notifyMinute = prefs.getInt("notify_minute", 0),
@@ -135,6 +137,7 @@ class ReleaseRepository(context: Context) {
             .putBoolean("enable_direct_add", newPrefs.enableDirectAdd)
             .putBoolean("always_show_card_actions", newPrefs.alwaysShowCardActions)
             .putBoolean("check_abb_daily", newPrefs.checkAbbDaily)
+            .putBoolean("hide_cover_art", newPrefs.hideCoverArt)
             .putString("theme_mode", newPrefs.themeModeCode)
             .putInt("notify_hour", newPrefs.notifyHour)
             .putInt("notify_minute", newPrefs.notifyMinute)
@@ -238,6 +241,7 @@ class ReleaseRepository(context: Context) {
         val target = targetQuery.trim()
         if (cand.isBlank() || target.isBlank()) return false
         if (cand.equals(target, ignoreCase = true)) return true
+        if (AudibleApiClient.isExactAuthorNameMatch(cand, target)) return true
         val escaped = Regex.escape(target)
         return Regex("\\b$escaped\\b", RegexOption.IGNORE_CASE).containsMatchIn(cand)
     }
@@ -434,7 +438,7 @@ class ReleaseRepository(context: Context) {
             val canonicalName = when (item.type) {
                 TrackType.AUTHOR -> {
                     results.flatMap { it.authors }
-                        .firstOrNull { it.equals(item.queryValue, ignoreCase = true) }
+                        .firstOrNull { AudibleApiClient.isExactAuthorNameMatch(it, item.queryValue) }
                         ?: AudibleApiClient.formatCanonicalName(item.queryValue)
                 }
                 TrackType.SERIES -> {
@@ -444,10 +448,25 @@ class ReleaseRepository(context: Context) {
                 }
                 TrackType.NARRATOR -> {
                     results.flatMap { it.narrators }
-                        .firstOrNull { it.equals(item.queryValue, ignoreCase = true) }
+                        .firstOrNull { AudibleApiClient.isExactAuthorNameMatch(it, item.queryValue) }
                         ?: AudibleApiClient.formatCanonicalName(item.queryValue)
                 }
                 TrackType.BOOK -> item.queryValue
+            }
+
+            // Strictly filter results to products that actually belong to this tracked source
+            val matchingProducts = when (item.type) {
+                TrackType.AUTHOR -> results.filter { prod ->
+                    prod.authors.any { a -> matchesPersonNameExactOrWordBoundary(a, canonicalName) }
+                }
+                TrackType.NARRATOR -> results.filter { prod ->
+                    prod.narrators.any { n -> matchesPersonNameExactOrWordBoundary(n, canonicalName) }
+                }
+                TrackType.SERIES -> results.filter { prod ->
+                    prod.seriesTitle.equals(canonicalName, ignoreCase = true) ||
+                        prod.seriesTitle.contains(canonicalName, ignoreCase = true)
+                }
+                TrackType.BOOK -> results
             }
 
             val updatedExtId: String? = when (item.type) {
@@ -455,13 +474,10 @@ class ReleaseRepository(context: Context) {
                     if (!item.externalId.isNullOrBlank() && item.externalId.contains("|")) {
                         item.externalId
                     } else {
-                        val exactSeriesProd = results.firstOrNull { prod ->
+                        val exactSeriesProd = matchingProducts.firstOrNull { prod ->
                             prod.seriesTitle.equals(item.queryValue.trim(), ignoreCase = true) &&
                                 prod.authors.isNotEmpty()
-                        } ?: results.firstOrNull { prod ->
-                            prod.seriesTitle.contains(item.queryValue.trim(), ignoreCase = true) &&
-                                prod.authors.isNotEmpty()
-                        }
+                        } ?: matchingProducts.firstOrNull { prod -> prod.authors.isNotEmpty() }
                         if (exactSeriesProd != null) {
                             val sAsin = exactSeriesProd.seriesAsin.ifBlank { item.pinnedAsin }
                             val pAuth = exactSeriesProd.authors.firstOrNull().orEmpty()
@@ -475,7 +491,7 @@ class ReleaseRepository(context: Context) {
                     if (!item.externalId.isNullOrBlank() && item.externalId.contains("|")) {
                         item.externalId
                     } else {
-                        val exactBookProd = results.firstOrNull()
+                        val exactBookProd = matchingProducts.firstOrNull()
                         if (exactBookProd != null) {
                             "${exactBookProd.asin}|${exactBookProd.authors.firstOrNull().orEmpty()}"
                         } else {
@@ -485,9 +501,9 @@ class ReleaseRepository(context: Context) {
                 }
                 TrackType.AUTHOR -> {
                     item.externalId?.takeIf { it.isNotBlank() }
-                        ?: results.firstOrNull { prod ->
+                        ?: matchingProducts.firstOrNull { prod ->
                             prod.primaryAuthorAsin.isNotBlank() &&
-                                prod.authors.firstOrNull()?.let { a -> matchesPersonNameExactOrWordBoundary(a, item.queryValue) } == true
+                                prod.authors.firstOrNull()?.let { a -> AudibleApiClient.isExactAuthorNameMatch(a, canonicalName) } == true
                         }?.primaryAuthorAsin
                 }
                 TrackType.NARRATOR -> item.externalId
@@ -495,26 +511,36 @@ class ReleaseRepository(context: Context) {
 
             effectiveExternalIds[item.id] = updatedExtId
 
-            val isAuthorShowingBookCover = item.type == TrackType.AUTHOR && (
+            val matchingCovers = matchingProducts.mapNotNull { it.coverUrl.takeIf { u -> u.isNotBlank() } }
+            val isVerifiedPortrait = item.thumbnailUrl.contains("amzn-author-media", ignoreCase = true) ||
+                item.thumbnailUrl.contains("wikimedia.org", ignoreCase = true)
+
+            val isAuthorThumbMissingOrStale = item.type == TrackType.AUTHOR && (
                 item.thumbnailUrl.isBlank() ||
                     item.thumbnailUrl in bookCoversSet ||
-                    (!item.thumbnailUrl.contains("amzn-author-media", ignoreCase = true) &&
-                        !item.thumbnailUrl.contains("ssl-images-amazon", ignoreCase = true))
+                    (!isVerifiedPortrait && item.thumbnailUrl !in matchingCovers) ||
+                    forceRefresh && !isVerifiedPortrait
             )
 
             var updatedThumb = item.thumbnailUrl
-            if (item.thumbnailUrl.isBlank() || isAuthorShowingBookCover) {
+            if (item.thumbnailUrl.isBlank() || isAuthorThumbMissingOrStale) {
                 val portrait = when (item.type) {
-                    TrackType.AUTHOR -> AudibleApiClient.fetchAudibleAuthorImageUrl(canonicalName, updatedExtId?.substringBefore("|"))
+                    TrackType.AUTHOR -> AudibleApiClient.fetchAudibleAuthorImageUrl(
+                        canonicalName,
+                        updatedExtId?.substringBefore("|")
+                    )
                     TrackType.NARRATOR -> AudibleApiClient.fetchNarratorPortraitUrl(canonicalName)
                     else -> null
                 }
                 if (!portrait.isNullOrBlank()) {
                     updatedThumb = portrait
-                } else if (updatedThumb.isBlank()) {
-                    val availableCovers = results.mapNotNull { it.coverUrl.takeIf { u -> u.isNotBlank() } }
-                    updatedThumb = availableCovers.firstOrNull { it !in assignedThumbnails }
-                        ?: availableCovers.firstOrNull().orEmpty()
+                } else if (matchingCovers.isNotEmpty()) {
+                    // Only fall back to covers of books ACTUALLY written/narrated by this source
+                    updatedThumb = matchingCovers.firstOrNull { it !in assignedThumbnails }
+                        ?: matchingCovers.first()
+                } else if (isAuthorThumbMissingOrStale && !isVerifiedPortrait) {
+                    // Clear stale wrong cover rather than keeping an unrelated author's image
+                    updatedThumb = ""
                 }
             }
 

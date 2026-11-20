@@ -131,6 +131,17 @@ fun asciiProgressBar(done: Int, total: Int, cells: Int = 8): String {
     return "[" + "#".repeat(filled) + "-".repeat(cells - filled) + "] $done/$total"
 }
 
+/**
+ * Compact 6-cell ASCII countdown bar for releases within 30 days:
+ * T-0d -> [######], T-15d -> [###---], T-30d -> [------]
+ */
+fun asciiCountdownBar(daysUntil: Long, cells: Int = 6): String {
+    val clamped = daysUntil.coerceIn(0L, 30L)
+    val ratio = (30L - clamped).toFloat() / 30f
+    val filled = (ratio * cells).roundToInt().coerceIn(0, cells)
+    return "[" + "#".repeat(filled) + "-".repeat(cells - filled) + "]"
+}
+
 @Composable
 fun CoverThumbnail(
     coverUrl: String,
@@ -161,7 +172,7 @@ fun CoverThumbnail(
                         val conn = (URL(coverUrl).openConnection() as HttpURLConnection).apply {
                             connectTimeout = 8_000
                             readTimeout = 8_000
-                            setRequestProperty("User-Agent", "NocturneTXT/3.0 (Android)")
+                            setRequestProperty("User-Agent", "NocturneTXT/3.1 (Android)")
                         }
                         try {
                             if (conn.responseCode in 200..299) {
@@ -225,8 +236,40 @@ fun CoverThumbnail(
 }
 
 /**
+ * Column-aligned 3-letter tag + value row (`SER: `, `AUT: `, `NAR: `)
+ * with muted comment key and bright syntax-highlighted value.
+ */
+@Composable
+fun AsciiFieldRow(
+    tag: String,
+    value: String,
+    valueColor: Color = LocalPtsPalette.current.foreground,
+    fontSizeSp: Int = 12,
+    modifier: Modifier = Modifier
+) {
+    val palette = LocalPtsPalette.current
+    val paddedTag = tag.uppercase().take(3).padEnd(3, ' ')
+    val annotated = buildAnnotatedString {
+        withStyle(SpanStyle(color = palette.comment, fontWeight = FontWeight.Normal)) {
+            append("$paddedTag: ")
+        }
+        withStyle(SpanStyle(color = valueColor, fontWeight = FontWeight.Normal)) {
+            append(value)
+        }
+    }
+    Text(
+        text = annotated,
+        modifier = modifier,
+        fontFamily = FontFamily.Monospace,
+        fontSize = fontSizeSp.sp,
+        lineHeight = (fontSizeSp + 5).sp,
+        style = TextStyle(fontFeatureSettings = MONO_FONT_FEATURES)
+    )
+}
+
+/**
  * Full-width column-measured ASCII section banner:
- * `+=== NOVEMBER 2026 (1 RELEASE • 24H 10M) =========+`
+ * `+=== DECEMBER 2026 (4) | 83H 53M =================+`
  */
 @Composable
 fun AsciiSectionHeader(
@@ -263,12 +306,12 @@ fun AsciiSectionHeader(
 
 /**
  * Full-width column-measured ASCII character rule (`- - - - - -`)
- * replacing Material HorizontalDivider inside cards and sections.
+ * with crisp visibility in both Dracula dark and Alucard light modes.
  */
 @Composable
 fun AsciiRule(
     pattern: String = "- ",
-    color: Color = LocalPtsPalette.current.surfaceLine,
+    color: Color = LocalPtsPalette.current.comment.copy(alpha = 0.55f),
     modifier: Modifier = Modifier
 ) {
     BoxWithConstraints(modifier = modifier.fillMaxWidth()) {
@@ -325,7 +368,7 @@ fun AsciiLeaderRow(
             withStyle(SpanStyle(color = keyColor, fontWeight = FontWeight.Normal)) {
                 append(cleanKey)
             }
-            withStyle(SpanStyle(color = palette.comment.copy(alpha = 0.55f), fontWeight = FontWeight.Normal)) {
+            withStyle(SpanStyle(color = palette.comment.copy(alpha = 0.38f), fontWeight = FontWeight.Normal)) {
                 append(" $dots ")
             }
             withStyle(
@@ -398,7 +441,7 @@ fun AsciiToggleRow(
             withStyle(SpanStyle(color = palette.foreground, fontWeight = FontWeight.Normal)) {
                 append(cleanLabel)
             }
-            withStyle(SpanStyle(color = palette.comment.copy(alpha = 0.55f), fontWeight = FontWeight.Normal)) {
+            withStyle(SpanStyle(color = palette.comment.copy(alpha = 0.38f), fontWeight = FontWeight.Normal)) {
                 append(" $dots ")
             }
             withStyle(SpanStyle(color = stateColor, fontWeight = FontWeight.Bold)) {
@@ -459,6 +502,53 @@ fun AsciiRadioButton(
             fontSize = 12.sp,
             fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
             color = if (isPressed) palette.background else ink,
+            style = TextStyle(fontFeatureSettings = MONO_FONT_FEATURES)
+        )
+    }
+}
+
+/**
+ * Inverted-video active pill/tab control for BottomThumbBar filters & numbered navigation tabs.
+ */
+@Composable
+fun AsciiInvertButton(
+    label: String,
+    active: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+    color: Color = LocalPtsPalette.current.purple
+) {
+    val palette = LocalPtsPalette.current
+    val interactionSource = remember { MutableInteractionSource() }
+    val isPressed by interactionSource.collectIsPressedAsState()
+
+    val inverted = active || isPressed
+    val bgColor = if (inverted) color else Color.Transparent
+    val fgColor = if (inverted) palette.background else color
+
+    Box(
+        contentAlignment = Alignment.Center,
+        modifier = modifier
+            .defaultMinSize(minHeight = 32.dp)
+            .background(bgColor)
+            .clickable(
+                interactionSource = interactionSource,
+                indication = null,
+                role = Role.Button,
+                onClick = onClick
+            )
+            .padding(horizontal = 6.dp, vertical = 3.dp)
+            .clearAndSetSemantics {
+                contentDescription = "$label${if (active) ", active" else ""}"
+            }
+    ) {
+        Text(
+            text = if (active) " $label " else "[$label]",
+            fontFamily = FontFamily.Monospace,
+            fontSize = 12.sp,
+            fontWeight = if (inverted) FontWeight.Bold else FontWeight.Medium,
+            color = fgColor,
+            softWrap = false,
             style = TextStyle(fontFeatureSettings = MONO_FONT_FEATURES)
         )
     }
@@ -530,8 +620,8 @@ fun AsciiTextField(
 }
 
 /**
- * Single-frame ASCII box (`+---[ HEADER ]---+` top border, aligned vertical side rails,
- * and `+----------------+` bottom border) with NO redundant inner Surface top/bottom rectangle.
+ * Single-frame ASCII box (`+---[ HEADER ]---+` top border, crisp aligned vertical side rails,
+ * and `+----------------+` bottom border).
  */
 @Composable
 fun AsciiBox(
@@ -573,7 +663,6 @@ fun AsciiBox(
             "+" + "-".repeat((cols - 2).coerceAtLeast(2)) + "+"
         }
 
-        // Exact pixel X centers of the leading '+' and trailing '+'
         val leftRailX = cellPx * 0.5f
         val rightRailX = (cols - 0.5f) * cellPx
 
@@ -622,12 +711,11 @@ fun AsciiBox(
                 )
             }
 
-            // Body with ONLY left and right vertical rails aligned directly under the '+' corners
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
                     .drawBehind {
-                        val strokePx = with(density) { 1.dp.toPx() }
+                        val strokePx = with(density) { 1.25.dp.toPx() }
                         val rx = rightRailX.coerceAtMost(size.width - strokePx)
                         drawLine(
                             color = borderColor,
@@ -642,7 +730,7 @@ fun AsciiBox(
                             strokeWidth = strokePx
                         )
                     }
-                    .padding(horizontal = 12.dp, vertical = 8.dp),
+                    .padding(horizontal = 12.dp, vertical = 6.dp),
                 content = content
             )
 
@@ -665,8 +753,7 @@ fun AsciiBox(
 }
 
 /**
- * Interactive ASCII bracket button with inverse-video press feedback (`bg = ink, fg = bg`)
- * and `[x] label` or `[ label ]` formatting.
+ * Interactive ASCII bracket button with inverse-video press feedback (`bg = ink, fg = bg`).
  */
 @Composable
 fun BracketButton(

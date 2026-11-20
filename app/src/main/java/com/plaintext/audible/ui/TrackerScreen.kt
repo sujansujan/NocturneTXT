@@ -76,9 +76,9 @@ data class ReleaseCardUiModel(
     val entity: ReleaseEntity,
     val upperTitle: String,
     val headerLabel: String,
-    val badgeTone: Int,
+    val urgencyTone: Int, // 0 = green (OUT TODAY/ABB), 1 = orange (1..7d), 2 = cyan (8..30d), 3 = comment (>30d/TBA/past)
     val isFutureOrTba: Boolean,
-    val seriesLine: String,
+    val seriesValue: String,
     val sameAuthorAndNarrator: Boolean,
     val runtimeFormatted: String,
     val publisherFormatted: String,
@@ -141,7 +141,6 @@ fun TrackerScreen(
     var showAboutPage by remember { mutableStateOf(false) }
     var recentlyDeletedItem by remember { mutableStateOf<TrackedItemEntity?>(null) }
 
-    // Inline ASCII Status Ticker state (replaces all system Android Toast bubbles)
     var statusTickerText by remember { mutableStateOf<String?>(null) }
     var statusTickerIsWarn by remember { mutableStateOf(false) }
     var statusTickerSeq by remember { mutableIntStateOf(0) }
@@ -168,7 +167,6 @@ fun TrackerScreen(
         }
     }
 
-    // Share-Sheet ASIN / Audible Link Importer state (#4)
     var activeSharedQuery by remember { mutableStateOf<String?>(null) }
     var isResolvingShared by remember { mutableStateOf(false) }
     var sharedResolution by remember { mutableStateOf<SharedImportResolution?>(null) }
@@ -362,16 +360,16 @@ fun TrackerScreen(
                     }
                 }
 
-                AsciiRule(pattern = "- ", color = palette.surfaceLine)
+                AsciiRule(pattern = "- ")
                 Spacer(modifier = Modifier.height(4.dp))
 
-                // Feature #4: Share-Sheet ASIN / Audible Link Importer Overlay Box
                 if (activeSharedQuery != null) {
                     SharedImportAsciiPanel(
                         rawInput = activeSharedQuery.orEmpty(),
                         isResolving = isResolvingShared,
                         resolution = sharedResolution,
                         trackedKeySet = trackedKeySet,
+                        hideCoverArt = prefs.hideCoverArt,
                         onTrack = { type, valStr, thumb, ext ->
                             handleAddTracked(type, valStr, 0, thumb, ext)
                         },
@@ -399,6 +397,7 @@ fun TrackerScreen(
                             focusedSourceQuery = focusedSourceQuery,
                             onClearFocusedSource = { focusedSourceQuery = null },
                             alwaysShowCardActions = prefs.alwaysShowCardActions,
+                            hideCoverArt = prefs.hideCoverArt,
                             showTbaExpanded = showTbaExpanded,
                             onToggleTba = { showTbaExpanded = !showTbaExpanded },
                             onClearNewBadges = {
@@ -441,7 +440,7 @@ fun TrackerScreen(
                                 val seriesPart = if (rel.seriesTitle.isNotBlank()) {
                                     " (${rel.seriesTitle}${rel.seriesSequence?.let { " #$it" }.orEmpty()})"
                                 } else ""
-                                val summary = "${rel.title}$seriesPart — By ${rel.authors} • Narrated by ${rel.narrators} • Release: ${rel.releaseDateIso}"
+                                val summary = "${rel.title}$seriesPart | By ${rel.authors} | Narrated by ${rel.narrators} | Release: ${rel.releaseDateIso}"
                                 clipboard.setPrimaryClip(ClipData.newPlainText("Audiobook Release", summary))
                                 postAsciiStatus("OK: RELEASE DETAILS COPIED TO CLIPBOARD", false)
                             },
@@ -455,7 +454,7 @@ fun TrackerScreen(
                                         putExtra(CalendarContract.Events.TITLE, "Audiobook Release: ${rel.title}")
                                         putExtra(
                                             CalendarContract.Events.DESCRIPTION,
-                                            "By ${rel.authors} • Narrated by ${rel.narrators} • Series: ${rel.seriesTitle} • ASIN: ${rel.asin}"
+                                            "By ${rel.authors} | Narrated by ${rel.narrators} | Series: ${rel.seriesTitle} | ASIN: ${rel.asin}"
                                         )
                                         putExtra(CalendarContract.EXTRA_EVENT_ALL_DAY, true)
                                         putExtra(CalendarContract.EXTRA_EVENT_BEGIN_TIME, startMs)
@@ -518,6 +517,7 @@ fun TrackerScreen(
                             releases = releases,
                             sourceFilter = trackedSourceFilter,
                             sortOrder = trackedSortOrder,
+                            hideCoverArt = prefs.hideCoverArt,
                             recentlyDeletedItem = recentlyDeletedItem,
                             onAddTracked = handleAddTracked,
                             onSelectSourceForFilter = { item ->
@@ -622,6 +622,7 @@ private fun SharedImportAsciiPanel(
     isResolving: Boolean,
     resolution: SharedImportResolution?,
     trackedKeySet: Set<String>,
+    hideCoverArt: Boolean,
     onTrack: (TrackType, String, String, String?) -> Unit,
     onOpenAbbQuery: (String) -> Unit,
     onClose: () -> Unit
@@ -631,7 +632,7 @@ private fun SharedImportAsciiPanel(
 
     val headerTag = resolution?.extractedAsin?.let { "ASIN $it" } ?: "SHARED LINK"
     AsciiBox(
-        headerLabel = "SHARE SHEET IMPORT • $headerTag",
+        headerLabel = "SHARE IMPORT | $headerTag",
         borderColor = palette.cyan,
         headerColor = palette.cyan
     ) {
@@ -644,7 +645,7 @@ private fun SharedImportAsciiPanel(
                 text = if (isResolving) {
                     "[ $spinner RESOLVING AUDIBLE METADATA... ]"
                 } else {
-                    "Source: ${rawInput.take(64)}"
+                    "SRC: ${rawInput.take(64)}"
                 },
                 color = if (isResolving) palette.cyan else palette.comment,
                 fontSizeSp = 11,
@@ -669,10 +670,10 @@ private fun SharedImportAsciiPanel(
             } else {
                 val topMatches = resolution.products.take(3)
                 topMatches.forEachIndexed { idx, prod ->
-                    Spacer(modifier = Modifier.height(6.dp))
+                    Spacer(modifier = Modifier.height(4.dp))
                     if (idx > 0) {
-                        AsciiRule(pattern = "- ", color = palette.surfaceLine)
-                        Spacer(modifier = Modifier.height(6.dp))
+                        AsciiRule(pattern = "- ")
+                        Spacer(modifier = Modifier.height(4.dp))
                     }
                     val seriesTracked = prod.seriesTitle.isNotBlank() &&
                         "SERIES:${prod.seriesTitle.trim().lowercase(Locale.US)}" in trackedKeySet
@@ -686,12 +687,14 @@ private fun SharedImportAsciiPanel(
                         "BOOK:${prod.title.trim().lowercase(Locale.US)}" in trackedKeySet
 
                     Row(verticalAlignment = Alignment.Top) {
-                        CoverThumbnail(
-                            coverUrl = prod.coverUrl,
-                            sizeDp = StandardThumbnailSize,
-                            borderColor = palette.cyan
-                        )
-                        Spacer(modifier = Modifier.width(10.dp))
+                        if (!hideCoverArt) {
+                            CoverThumbnail(
+                                coverUrl = prod.coverUrl,
+                                sizeDp = StandardThumbnailSize,
+                                borderColor = palette.cyan
+                            )
+                            Spacer(modifier = Modifier.width(10.dp))
+                        }
                         Column(modifier = Modifier.weight(1f)) {
                             MonoText(
                                 text = prod.title.uppercase(),
@@ -701,16 +704,13 @@ private fun SharedImportAsciiPanel(
                             )
                             if (prod.seriesTitle.isNotBlank()) {
                                 val seqPart = prod.seriesSequence?.let { " #$it" }.orEmpty()
-                                MonoText(
-                                    text = "Series: ${prod.seriesTitle}$seqPart",
-                                    color = palette.purple,
-                                    fontSizeSp = 11
-                                )
+                                AsciiFieldRow("SER", "${prod.seriesTitle}$seqPart", palette.purple, 11)
                             }
-                            MonoText(
-                                text = "Author: ${prod.authors.joinToString(", ")} • ${prod.releaseDateIso}",
-                                color = palette.yellow,
-                                fontSizeSp = 11
+                            AsciiFieldRow(
+                                "AUT",
+                                "${prod.authors.joinToString(", ")} | ${prod.releaseDateIso}",
+                                palette.foreground,
+                                11
                             )
                         }
                     }
@@ -816,7 +816,7 @@ private fun BottomThumbBar(
 
     Surface(
         color = palette.background,
-        border = BorderStroke(1.dp, palette.surfaceLine),
+        border = BorderStroke(1.dp, palette.comment.copy(alpha = 0.6f)),
         modifier = modifier
             .fillMaxWidth()
             .graphicsLayer {
@@ -824,7 +824,6 @@ private fun BottomThumbBar(
             }
     ) {
         Column(modifier = Modifier.fillMaxWidth()) {
-            // Inline ASCII Status Ticker replacing Android system Toast bubbles
             if (!statusTickerText.isNullOrBlank()) {
                 val tickerColor = if (statusTickerIsWarn) palette.orange else palette.green
                 Row(
@@ -848,7 +847,7 @@ private fun BottomThumbBar(
                         onClick = onDismissStatusTicker
                     )
                 }
-                AsciiRule(pattern = "-", color = palette.surfaceLine)
+                AsciiRule(pattern = "-")
             }
 
             if (activeTab == ActiveTab.UPCOMING) {
@@ -856,15 +855,15 @@ private fun BottomThumbBar(
                     modifier = Modifier
                         .fillMaxWidth()
                         .horizontalScroll(rememberScrollState())
-                        .padding(horizontal = 8.dp, vertical = 2.dp),
+                        .padding(horizontal = 8.dp, vertical = 3.dp),
                     horizontalArrangement = Arrangement.spacedBy(4.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     MonoText(text = "FLT:", color = palette.comment, fontSizeSp = 11)
                     QuickFilter.values().forEach { filter ->
                         val chipLabel = when (filter) {
-                            QuickFilter.ABB -> "ABB ($abbCount)"
-                            QuickFilter.DND -> "DND ($dndCount)"
+                            QuickFilter.ABB -> "ABB:$abbCount"
+                            QuickFilter.DND -> "DND:$dndCount"
                             else -> filter.label
                         }
                         val chipColor = when (filter) {
@@ -873,7 +872,7 @@ private fun BottomThumbBar(
                             QuickFilter.RECENT_30D -> palette.orange
                             else -> palette.purple
                         }
-                        BracketButton(
+                        AsciiInvertButton(
                             label = chipLabel,
                             active = activeFilter == filter,
                             color = chipColor,
@@ -881,19 +880,19 @@ private fun BottomThumbBar(
                         )
                     }
                 }
-                AsciiRule(pattern = "-", color = palette.surfaceLine)
+                AsciiRule(pattern = "-")
             } else if (activeTab == ActiveTab.TRACKED) {
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
                         .horizontalScroll(rememberScrollState())
-                        .padding(horizontal = 8.dp, vertical = 2.dp),
+                        .padding(horizontal = 8.dp, vertical = 3.dp),
                     horizontalArrangement = Arrangement.spacedBy(4.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     MonoText(text = "FLT:", color = palette.comment, fontSizeSp = 11)
                     TrackedSourceFilter.values().forEach { tf ->
-                        BracketButton(
+                        AsciiInvertButton(
                             label = tf.label,
                             active = trackedSourceFilter == tf,
                             color = palette.purple,
@@ -902,7 +901,7 @@ private fun BottomThumbBar(
                     }
                     MonoText(text = "| SRT:", color = palette.comment, fontSizeSp = 11)
                     TrackedSortOrder.values().forEach { so ->
-                        BracketButton(
+                        AsciiInvertButton(
                             label = so.label,
                             active = trackedSortOrder == so,
                             color = palette.cyan,
@@ -910,29 +909,33 @@ private fun BottomThumbBar(
                         )
                     }
                 }
-                AsciiRule(pattern = "-", color = palette.surfaceLine)
+                AsciiRule(pattern = "-")
             }
 
+            // Numbered, inverse-video terminal navigation bar
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(horizontal = 8.dp, vertical = 2.dp),
+                    .padding(horizontal = 8.dp, vertical = 4.dp),
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                BracketButton(
-                    label = "UPCOMING ($upcomingCount)",
+                AsciiInvertButton(
+                    label = "1:UPCOMING($upcomingCount)",
                     active = activeTab == ActiveTab.UPCOMING,
+                    color = palette.cyan,
                     onClick = { onSelectTab(ActiveTab.UPCOMING) }
                 )
-                BracketButton(
-                    label = "TRACKED ($trackedCount)",
+                AsciiInvertButton(
+                    label = "2:TRACKED($trackedCount)",
                     active = activeTab == ActiveTab.TRACKED,
+                    color = palette.cyan,
                     onClick = { onSelectTab(ActiveTab.TRACKED) }
                 )
-                BracketButton(
-                    label = "SETTINGS",
+                AsciiInvertButton(
+                    label = "3:SET",
                     active = activeTab == ActiveTab.SETTINGS,
+                    color = palette.cyan,
                     onClick = { onSelectTab(ActiveTab.SETTINGS) }
                 )
             }
@@ -955,6 +958,7 @@ private fun UpcomingFeedView(
     focusedSourceQuery: String?,
     onClearFocusedSource: () -> Unit,
     alwaysShowCardActions: Boolean,
+    hideCoverArt: Boolean,
     showTbaExpanded: Boolean,
     onToggleTba: () -> Unit,
     onClearNewBadges: () -> Unit,
@@ -1046,21 +1050,25 @@ private fun UpcomingFeedView(
             val daysUntil = parsedDate?.let { ChronoUnit.DAYS.between(today, it) }
 
             val isFutureOrTba = daysUntil == null || daysUntil >= 0L
-            val countdownBadge = when {
-                daysUntil == null -> "[ TBA ]"
-                daysUntil == 0L -> "[ OUT TODAY ]"
-                daysUntil < 0L -> "[ ${-daysUntil}d AGO ]"
-                else -> "[ T-${daysUntil}d ]"
+            // Pure 7-bit ASCII header with no nested double brackets, plus 6-cell countdown bar for <=30d
+            val countdownPart = when {
+                daysUntil == null -> "TBA"
+                daysUntil == 0L -> "OUT TODAY"
+                daysUntil < 0L -> "${-daysUntil}d AGO"
+                daysUntil in 1L..30L -> "${asciiCountdownBar(daysUntil)} T-${daysUntil}d"
+                else -> "T-${daysUntil}d"
             }
-            val statusHeaderSuffix = when {
-                rel.abbAvailable -> " • [ ABB ]"
-                rel.isNewDiscovery && isFutureOrTba -> " • [ NEW ]"
+            val statusSuffix = when {
+                rel.abbAvailable -> " | ABB"
+                rel.isNewDiscovery && isFutureOrTba -> " | NEW"
                 else -> ""
             }
-            val badgeTone = when {
+            // Urgency-tiered color codes:
+            // 0 = green (OUT TODAY / ABB), 1 = orange (1..7d), 2 = cyan (8..30d), 3 = comment (>30d / TBA / past)
+            val urgencyTone = when {
                 rel.abbAvailable || daysUntil == 0L -> 0
-                daysUntil != null && daysUntil < 0L -> 2
-                daysUntil != null && daysUntil in 1..7 -> 1
+                daysUntil != null && daysUntil in 1L..7L -> 1
+                daysUntil != null && daysUntil in 8L..30L -> 2
                 else -> 3
             }
 
@@ -1080,13 +1088,13 @@ private fun UpcomingFeedView(
 
             val primaryAuthor = rel.authors.split(",").firstOrNull()?.trim().orEmpty()
             val isAuthorTracked = primaryAuthor.isNotBlank() && authorList.any { a ->
-                a.queryValue.equals(primaryAuthor, ignoreCase = true)
+                AudibleApiClient.isExactAuthorNameMatch(a.queryValue, primaryAuthor)
             }
 
             val primaryNarrator = rel.narrators.split(",").firstOrNull()?.trim()
                 ?.takeIf { !it.equals("TBA", ignoreCase = true) }.orEmpty()
             val isNarratorTracked = primaryNarrator.isNotBlank() && narratorList.any { n ->
-                n.queryValue.equals(primaryNarrator, ignoreCase = true)
+                AudibleApiClient.isExactAuthorNameMatch(n.queryValue, primaryNarrator)
             }
 
             val seq = rel.seriesSequence
@@ -1105,11 +1113,11 @@ private fun UpcomingFeedView(
             return ReleaseCardUiModel(
                 entity = rel,
                 upperTitle = cleanedTitle.uppercase(),
-                headerLabel = "${rel.releaseDateIso} • $countdownBadge$statusHeaderSuffix",
-                badgeTone = badgeTone,
+                headerLabel = "${rel.releaseDateIso} | $countdownPart$statusSuffix",
+                urgencyTone = urgencyTone,
                 isFutureOrTba = isFutureOrTba,
-                seriesLine = if (rel.seriesTitle.isNotBlank()) {
-                    "Series: ${rel.seriesTitle}${seq?.let { " #$it" }.orEmpty()}"
+                seriesValue = if (rel.seriesTitle.isNotBlank()) {
+                    "${rel.seriesTitle}${seq?.let { " #$it" }.orEmpty()}"
                 } else "",
                 sameAuthorAndNarrator = sameAuthorAndNarrator,
                 runtimeFormatted = runtimeStr,
@@ -1171,13 +1179,12 @@ private fun UpcomingFeedView(
                 }.getOrDefault("SCHEDULED")
             }
             .map { (monthName, list) ->
-                val noun = if (list.size == 1) "RELEASE" else "RELEASES"
                 val totalMins = list.sumOf { it.entity.runtimeMinutes }
                 val runtimeBadge = if (totalMins > 0) {
-                    " • ${totalMins / 60}H ${totalMins % 60}M"
+                    " | ${totalMins / 60}H ${totalMins % 60}M"
                 } else ""
                 MonthGroupUiModel(
-                    monthHeader = "$monthName (${list.size} $noun$runtimeBadge)",
+                    monthHeader = "$monthName (${list.size})$runtimeBadge",
                     cards = list
                 )
             }
@@ -1210,7 +1217,7 @@ private fun UpcomingFeedView(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         MonoText(
-                            text = "Showing releases for: $focusedSourceQuery",
+                            text = "SRC: $focusedSourceQuery",
                             color = palette.cyan,
                             fontSizeSp = 12,
                             bold = true,
@@ -1265,7 +1272,7 @@ private fun UpcomingFeedView(
                         } else if (quickFilter == QuickFilter.ABB) {
                             "No verified AudioBookBay releases found yet. Expand any released card to check ABB on demand."
                         } else {
-                            "No scheduled upcoming releases match [${quickFilter.label}].\nTap [ TRACKED ] on the bottom bar to search the live catalog."
+                            "No scheduled upcoming releases match [${quickFilter.label}].\nTap [ 2:TRACKED ] on the bottom bar to search the live catalog."
                         },
                         color = palette.comment,
                         fontSizeSp = 12
@@ -1286,6 +1293,7 @@ private fun UpcomingFeedView(
                 ReleaseScorecard(
                     card = card,
                     alwaysShowCardActions = alwaysShowCardActions,
+                    hideCoverArt = hideCoverArt,
                     onOpenAudibleSearch = { onOpenAudibleSearch(card) },
                     onOpenAudioBookBay = { onOpenAudioBookBay(card) },
                     onOpenOrCopyMagnet = { onOpenOrCopyMagnet(card) },
@@ -1323,6 +1331,7 @@ private fun UpcomingFeedView(
                     ReleaseScorecard(
                         card = card,
                         alwaysShowCardActions = alwaysShowCardActions,
+                        hideCoverArt = hideCoverArt,
                         onOpenAudibleSearch = { onOpenAudibleSearch(card) },
                         onOpenAudioBookBay = { onOpenAudioBookBay(card) },
                         onOpenOrCopyMagnet = { onOpenOrCopyMagnet(card) },
@@ -1350,6 +1359,7 @@ private fun UpcomingFeedView(
 private fun ReleaseScorecard(
     card: ReleaseCardUiModel,
     alwaysShowCardActions: Boolean,
+    hideCoverArt: Boolean,
     onOpenAudibleSearch: () -> Unit,
     onOpenAudioBookBay: () -> Unit,
     onOpenOrCopyMagnet: () -> Unit,
@@ -1366,22 +1376,24 @@ private fun ReleaseScorecard(
     val rel = card.entity
     var isExpanded by remember(rel.asin) { mutableStateOf(false) }
 
-    val badgeColor = when (card.badgeTone) {
-        0 -> palette.green
-        1 -> palette.orange
-        2 -> palette.comment
-        else -> palette.cyan
+    val urgencyColor = when (card.urgencyTone) {
+        0 -> palette.green   // OUT TODAY / ABB
+        1 -> palette.orange  // T-1d..7d
+        2 -> palette.cyan    // T-8d..30d
+        else -> palette.comment // >30d / TBA / past
+    }
+
+    val frameBorderColor = when {
+        isExpanded -> palette.cyan
+        rel.abbAvailable -> palette.green
+        rel.isNewDiscovery && card.isFutureOrTba -> palette.pink
+        else -> urgencyColor
     }
 
     AsciiBox(
         headerLabel = card.headerLabel,
-        borderColor = when {
-            isExpanded -> palette.cyan
-            rel.abbAvailable -> palette.green
-            rel.isNewDiscovery && card.isFutureOrTba -> palette.pink
-            else -> palette.comment
-        },
-        headerColor = badgeColor,
+        borderColor = frameBorderColor,
+        headerColor = urgencyColor,
         onClick = {
             val nextExpanded = !isExpanded
             isExpanded = nextExpanded
@@ -1394,12 +1406,14 @@ private fun ReleaseScorecard(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.Top
         ) {
-            CoverThumbnail(
-                coverUrl = rel.coverUrl,
-                sizeDp = StandardThumbnailSize,
-                borderColor = badgeColor
-            )
-            Spacer(modifier = Modifier.width(10.dp))
+            if (!hideCoverArt) {
+                CoverThumbnail(
+                    coverUrl = rel.coverUrl,
+                    sizeDp = StandardThumbnailSize,
+                    borderColor = urgencyColor
+                )
+                Spacer(modifier = Modifier.width(10.dp))
+            }
             Column(modifier = Modifier.weight(1f)) {
                 MonoText(
                     text = card.upperTitle,
@@ -1407,31 +1421,27 @@ private fun ReleaseScorecard(
                     fontSizeSp = 14,
                     bold = true
                 )
-                if (card.seriesLine.isNotEmpty()) {
-                    MonoText(
-                        text = card.seriesLine,
-                        color = palette.purple,
-                        fontSizeSp = 12
-                    )
+                if (card.seriesValue.isNotEmpty()) {
+                    AsciiFieldRow(tag = "SER", value = card.seriesValue, valueColor = palette.purple)
                 }
                 if (card.sameAuthorAndNarrator) {
-                    MonoText(text = "By & Narrated: ${rel.authors}", color = palette.yellow, fontSizeSp = 12)
+                    AsciiFieldRow(tag = "AUT", value = "${rel.authors} (Narr)", valueColor = palette.foreground)
                 } else {
-                    MonoText(text = "Author: ${rel.authors}", color = palette.yellow, fontSizeSp = 12)
-                    MonoText(text = "Narrator: ${rel.narrators}", color = palette.orange, fontSizeSp = 12)
+                    AsciiFieldRow(tag = "AUT", value = rel.authors, valueColor = palette.foreground)
+                    AsciiFieldRow(tag = "NAR", value = rel.narrators, valueColor = palette.yellow)
                 }
             }
         }
 
         if (card.hasSeriesGap && card.matchedSeriesItem != null) {
-            Spacer(modifier = Modifier.height(6.dp))
+            Spacer(modifier = Modifier.height(4.dp))
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween,
                 modifier = Modifier.fillMaxWidth()
             ) {
                 MonoText(
-                    text = "[ ! GAP: Book #${card.unreadGapBookNum} Unread (Read: #${card.matchedSeriesItem.lastReadSequence}) ]",
+                    text = "[ ! GAP: #${card.unreadGapBookNum} Unread (Read: #${card.matchedSeriesItem.lastReadSequence}) ]",
                     color = palette.red,
                     fontSizeSp = 11,
                     bold = true
@@ -1444,52 +1454,52 @@ private fun ReleaseScorecard(
             }
         }
 
-        // Dotted-Leader Boxscore Metadata Grid & Character Dividers (matching the preview layout)
-        Spacer(modifier = Modifier.height(6.dp))
-        AsciiRule(pattern = "- ", color = palette.surfaceLine)
+        // Collapsed card shows ONLY Runtime; Publisher & Match live in the expanded view
         Spacer(modifier = Modifier.height(4.dp))
-
-        if (rel.previousReleaseDateIso.isNotBlank() && rel.previousReleaseDateIso != rel.releaseDateIso) {
-            AsciiLeaderRow(
-                key = "Date Moved",
-                value = "${rel.previousReleaseDateIso} -> ${rel.releaseDateIso}",
-                keyColor = palette.orange,
-                valueColor = palette.orange,
-                fontSizeSp = 11
-            )
-        }
-        if (rel.narratorJustAnnounced) {
-            AsciiLeaderRow(
-                key = "Narrator Alert",
-                value = rel.narrators,
-                keyColor = palette.green,
-                valueColor = palette.green,
-                fontSizeSp = 11
-            )
-        }
+        AsciiRule(pattern = "- ")
+        Spacer(modifier = Modifier.height(3.dp))
         AsciiLeaderRow(
             key = "Runtime",
             value = card.runtimeFormatted,
             valueColor = palette.cyan,
             fontSizeSp = 11
         )
-        AsciiLeaderRow(
-            key = "Publisher",
-            value = card.publisherFormatted,
-            valueColor = palette.foreground,
-            fontSizeSp = 11
-        )
-        AsciiLeaderRow(
-            key = "Match",
-            value = card.matchedSourcesFormatted,
-            valueColor = palette.purple,
-            fontSizeSp = 11
-        )
 
         if (isExpanded) {
-            Spacer(modifier = Modifier.height(6.dp))
-            AsciiRule(pattern = "- ", color = palette.surfaceLine)
-            Spacer(modifier = Modifier.height(6.dp))
+            if (rel.previousReleaseDateIso.isNotBlank() && rel.previousReleaseDateIso != rel.releaseDateIso) {
+                AsciiLeaderRow(
+                    key = "Date Moved",
+                    value = "${rel.previousReleaseDateIso} -> ${rel.releaseDateIso}",
+                    keyColor = palette.orange,
+                    valueColor = palette.orange,
+                    fontSizeSp = 11
+                )
+            }
+            if (rel.narratorJustAnnounced) {
+                AsciiLeaderRow(
+                    key = "Narrator Alert",
+                    value = rel.narrators,
+                    keyColor = palette.green,
+                    valueColor = palette.green,
+                    fontSizeSp = 11
+                )
+            }
+            AsciiLeaderRow(
+                key = "Publisher",
+                value = card.publisherFormatted,
+                valueColor = palette.foreground,
+                fontSizeSp = 11
+            )
+            AsciiLeaderRow(
+                key = "Match",
+                value = card.matchedSourcesFormatted,
+                valueColor = palette.purple,
+                fontSizeSp = 11
+            )
+
+            Spacer(modifier = Modifier.height(4.dp))
+            AsciiRule(pattern = "- ")
+            Spacer(modifier = Modifier.height(4.dp))
 
             MonoText(
                 text = rel.synopsis.ifBlank { "No publisher summary posted yet for this listing." },
@@ -1499,11 +1509,10 @@ private fun ReleaseScorecard(
         }
 
         if (isExpanded || alwaysShowCardActions) {
-            Spacer(modifier = Modifier.height(6.dp))
-            AsciiRule(pattern = "- ", color = palette.surfaceLine)
             Spacer(modifier = Modifier.height(4.dp))
+            AsciiRule(pattern = "- ")
+            Spacer(modifier = Modifier.height(2.dp))
 
-            // Source Tracking Status Row: [x] Series  [x] Author  [+ Narrator]
             FlowRow(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -1620,6 +1629,7 @@ private fun TrackedEntitiesView(
     releases: List<ReleaseEntity>,
     sourceFilter: TrackedSourceFilter,
     sortOrder: TrackedSortOrder,
+    hideCoverArt: Boolean,
     recentlyDeletedItem: TrackedItemEntity?,
     onAddTracked: (TrackType, String, Int, String, String?) -> Unit,
     onSelectSourceForFilter: (TrackedItemEntity) -> Unit,
@@ -1639,6 +1649,15 @@ private fun TrackedEntitiesView(
     var useDirectMode by remember { mutableStateOf(false) }
     var directType by remember { mutableStateOf(TrackType.SERIES) }
     var directLastRead by remember { mutableStateOf("0") }
+
+    // Two-tap inline delete guard (`[ x ]` -> `[ del? ]` auto-resetting after 3s)
+    var pendingDeleteId by remember { mutableStateOf<Long?>(null) }
+    LaunchedEffect(pendingDeleteId) {
+        if (pendingDeleteId != null) {
+            delay(3000L)
+            pendingDeleteId = null
+        }
+    }
 
     val searchSpinner = rememberAsciiSpinner(active = isSearchingCatalog)
 
@@ -1892,49 +1911,35 @@ private fun TrackedEntitiesView(
                 val sameAuthorAndNarrator = authorsStr.trim().equals(narratorsStr.trim(), ignoreCase = true)
 
                 AsciiBox(
-                    headerLabel = "${prod.releaseDateIso} • ${prod.asin}",
+                    headerLabel = "${prod.releaseDateIso} | ${prod.asin}",
                     borderColor = palette.cyan,
                     headerColor = palette.cyan
                 ) {
                     Row(verticalAlignment = Alignment.Top) {
-                        CoverThumbnail(
-                            coverUrl = prod.coverUrl,
-                            sizeDp = StandardThumbnailSize,
-                            borderColor = palette.cyan
-                        )
-                        Spacer(modifier = Modifier.width(10.dp))
+                        if (!hideCoverArt) {
+                            CoverThumbnail(
+                                coverUrl = prod.coverUrl,
+                                sizeDp = StandardThumbnailSize,
+                                borderColor = palette.cyan
+                            )
+                            Spacer(modifier = Modifier.width(10.dp))
+                        }
                         Column(modifier = Modifier.weight(1f)) {
                             MonoText(text = cleanedTitle.uppercase(), bold = true, fontSizeSp = 14)
                             if (prod.seriesTitle.isNotBlank()) {
                                 val seqPart = prod.seriesSequence?.let { " #$it" }.orEmpty()
-                                MonoText(
-                                    text = "Series: ${prod.seriesTitle}$seqPart",
-                                    color = palette.purple,
-                                    fontSizeSp = 12
-                                )
+                                AsciiFieldRow("SER", "${prod.seriesTitle}$seqPart", palette.purple)
                             }
                             if (sameAuthorAndNarrator && authorsStr.isNotBlank()) {
-                                MonoText(
-                                    text = "By & Narrated: $authorsStr",
-                                    color = palette.yellow,
-                                    fontSizeSp = 12
-                                )
+                                AsciiFieldRow("AUT", "$authorsStr (Narr)", palette.foreground)
                             } else {
-                                MonoText(
-                                    text = "Author: $authorsStr",
-                                    color = palette.yellow,
-                                    fontSizeSp = 12
-                                )
-                                MonoText(
-                                    text = "Narrator: $narratorsStr",
-                                    color = palette.orange,
-                                    fontSizeSp = 12
-                                )
+                                AsciiFieldRow("AUT", authorsStr, palette.foreground)
+                                AsciiFieldRow("NAR", narratorsStr, palette.yellow)
                             }
                         }
                     }
-                    Spacer(modifier = Modifier.height(6.dp))
-                    AsciiRule(pattern = "- ", color = palette.surfaceLine)
+                    Spacer(modifier = Modifier.height(4.dp))
+                    AsciiRule(pattern = "- ")
                     Spacer(modifier = Modifier.height(2.dp))
                     FlowRow(
                         modifier = Modifier.fillMaxWidth(),
@@ -2007,6 +2012,7 @@ private fun TrackedEntitiesView(
             contentType = { "tracked_item" }
         ) { item ->
             val upcomingBadgeCount = upcomingCountsByItemId[item.id] ?: 0
+            val hasUpcoming = upcomingBadgeCount > 0
             val typeAccent = when (item.type) {
                 TrackType.SERIES -> palette.purple
                 TrackType.AUTHOR -> palette.yellow
@@ -2020,9 +2026,15 @@ private fun TrackedEntitiesView(
                 TrackType.BOOK -> "[BOK]"
             }
 
+            // De-emphasize 0 UPCOMING rows to comment; highlight 1+ UPCOMING in green/typeAccent
+            val headerTint = if (hasUpcoming) palette.green else palette.comment
+            val borderTint = if (hasUpcoming) typeAccent else palette.comment.copy(alpha = 0.6f)
+            val isConfirmingDelete = pendingDeleteId == item.id
+
             AsciiBox(
-                headerLabel = "${item.type.name} • [ $upcomingBadgeCount UPCOMING ]",
-                headerColor = typeAccent,
+                headerLabel = "${item.type.name} | $upcomingBadgeCount UPCOMING",
+                borderColor = borderTint,
+                headerColor = headerTint,
                 onClick = { onSelectSourceForFilter(item) }
             ) {
                 Row(
@@ -2034,32 +2046,27 @@ private fun TrackedEntitiesView(
                         modifier = Modifier.weight(1f),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        CoverThumbnail(
-                            coverUrl = item.thumbnailUrl,
-                            sizeDp = StandardThumbnailSize,
-                            fallbackText = fallbackBadge,
-                            borderColor = typeAccent
-                        )
-                        Spacer(modifier = Modifier.width(10.dp))
+                        if (!hideCoverArt) {
+                            CoverThumbnail(
+                                coverUrl = item.thumbnailUrl,
+                                sizeDp = StandardThumbnailSize,
+                                fallbackText = fallbackBadge,
+                                borderColor = borderTint
+                            )
+                            Spacer(modifier = Modifier.width(10.dp))
+                        }
                         Column(modifier = Modifier.weight(1f)) {
                             MonoText(
                                 text = item.queryValue.uppercase(),
+                                color = if (hasUpcoming) palette.foreground else palette.foreground.copy(alpha = 0.85f),
                                 fontSizeSp = 14,
                                 bold = true
                             )
                             if ((item.type == TrackType.SERIES || item.type == TrackType.BOOK) && item.pinnedAuthor.isNotBlank()) {
-                                MonoText(
-                                    text = "Author: ${item.pinnedAuthor}",
-                                    color = palette.yellow,
-                                    fontSizeSp = 12
-                                )
+                                AsciiFieldRow("AUT", item.pinnedAuthor, palette.foreground)
                             }
                             if (item.type == TrackType.SERIES) {
-                                MonoText(
-                                    text = "Last Read: #${item.lastReadSequence}",
-                                    color = palette.purple,
-                                    fontSizeSp = 12
-                                )
+                                AsciiFieldRow("SEQ", "Last Read #${item.lastReadSequence}", palette.purple)
                             }
                         }
                     }
@@ -2078,11 +2085,23 @@ private fun TrackedEntitiesView(
                                 onClick = { onUpdateSeriesSeq(item, item.lastReadSequence + 1) }
                             )
                         }
-                        BracketButton(
-                            label = "x",
-                            color = palette.red,
-                            onClick = { onDeleteTracked(item) }
-                        )
+                        if (isConfirmingDelete) {
+                            AsciiInvertButton(
+                                label = "del?",
+                                active = true,
+                                color = palette.red,
+                                onClick = {
+                                    pendingDeleteId = null
+                                    onDeleteTracked(item)
+                                }
+                            )
+                        } else {
+                            BracketButton(
+                                label = "x",
+                                color = palette.red,
+                                onClick = { pendingDeleteId = item.id }
+                            )
+                        }
                     }
                 }
             }
@@ -2138,7 +2157,7 @@ private fun SettingsAndBackupView(
                         }
                     }
                 }
-                AsciiRule(pattern = "- ", color = palette.surfaceLine)
+                AsciiRule(pattern = "- ")
                 AsciiToggleRow(
                     label = "English Language Only",
                     checked = prefs.englishOnly,
@@ -2158,6 +2177,15 @@ private fun SettingsAndBackupView(
                     label = "Always Show Card Actions",
                     checked = prefs.alwaysShowCardActions,
                     onToggle = { onUpdatePrefs(prefs.copy(alwaysShowCardActions = !prefs.alwaysShowCardActions)) }
+                )
+                AsciiToggleRow(
+                    label = "Hide Cover Art (Pure Text)",
+                    checked = prefs.hideCoverArt,
+                    onToggle = {
+                        val next = !prefs.hideCoverArt
+                        onUpdatePrefs(prefs.copy(hideCoverArt = next))
+                        onPostStatus(if (next) "PURE TEXT MODE: ON" else "COVER ART: ON", false)
+                    }
                 )
                 AsciiToggleRow(
                     label = "Daily AudioBookBay Check",
@@ -2189,7 +2217,7 @@ private fun SettingsAndBackupView(
         }
 
         item(key = "cfg_notif") {
-            AsciiBox(headerLabel = "NOTIFICATION SCHEDULE (T-7d, T-0d & ABB)") {
+            AsciiBox(headerLabel = "NOTIFICATION SCHEDULE (T-7d, T-0d, ABB)") {
                 AsciiLeaderRow(
                     key = "Daily Alert Time",
                     value = "%02d:%02d Local".format(prefs.notifyHour, prefs.notifyMinute),
@@ -2240,7 +2268,7 @@ private fun SettingsAndBackupView(
                 )
                 AsciiLeaderRow(
                     key = "Sync Telemetry",
-                    value = "${syncTelemetry.lastSyncSourcesCount} src • ${syncTelemetry.statusSummary}",
+                    value = "${syncTelemetry.lastSyncSourcesCount} src | ${syncTelemetry.statusSummary}",
                     valueColor = if (syncTelemetry.lastSyncUsedCachedFallback) palette.orange else palette.green,
                     fontSizeSp = 12
                 )
@@ -2257,7 +2285,7 @@ private fun SettingsAndBackupView(
                     fontSizeSp = 11
                 )
                 Spacer(modifier = Modifier.height(6.dp))
-                AsciiRule(pattern = "- ", color = palette.surfaceLine)
+                AsciiRule(pattern = "- ")
                 Spacer(modifier = Modifier.height(4.dp))
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -2282,7 +2310,7 @@ private fun SettingsAndBackupView(
             AsciiBox(headerLabel = "PLAIN-TEXT JSON BACKUP & RESTORE") {
                 AsciiLeaderRow(
                     key = "Backup Format",
-                    value = "Schema v7 (.json)",
+                    value = "Schema v8 (.json)",
                     valueColor = palette.comment,
                     fontSizeSp = 11
                 )
@@ -2310,7 +2338,7 @@ private fun SettingsAndBackupView(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     MonoText(
-                        text = "Version 3.0.0, credits & architecture",
+                        text = "Version 3.1.0, credits & architecture",
                         color = palette.comment,
                         fontSizeSp = 12,
                         modifier = Modifier.weight(1f)
@@ -2355,7 +2383,7 @@ private fun AboutPageView(onBack: () -> Unit) {
                     bold = true
                 )
                 MonoText(
-                    text = "Version 3.0.0 • Plain-Text Audiobook Release Tracker",
+                    text = "Version 3.1.0 | Plain-Text Audiobook Release Tracker",
                     color = palette.cyan,
                     fontSizeSp = 12,
                     bold = true
@@ -2372,13 +2400,13 @@ private fun AboutPageView(onBack: () -> Unit) {
         item {
             AsciiBox(headerLabel = "DESIGN & AESTHETIC CREDITS") {
                 MonoText(
-                    text = "• Layout & Typography: Inspired by PlainTextSports.com, with single-frame column-measured ASCII boxes (+---+), dotted-leader key/value rows, character dividers, and inverse-video bracketed controls.",
+                    text = "- Layout & Typography: Inspired by PlainTextSports.com, with pure 7-bit ASCII headers (+---[ ... ]---+), column-aligned SER/AUT/NAR fields, countdown bars, dotted-leader rows, and inverse-video terminal controls.",
                     color = palette.foreground,
                     fontSizeSp = 12
                 )
                 Spacer(modifier = Modifier.height(4.dp))
                 MonoText(
-                    text = "• Color Palettes: Official Dracula Dark (#282A36) and Alucard Light (#FFFBEB) specifications with System Auto theme synchronization.",
+                    text = "- Color Palettes: Official Dracula Dark (#282A36) and Alucard Light (#FFFBEB) specifications with System Auto theme synchronization.",
                     color = palette.foreground,
                     fontSizeSp = 12
                 )
@@ -2388,13 +2416,13 @@ private fun AboutPageView(onBack: () -> Unit) {
         item {
             AsciiBox(headerLabel = "ENGINE & PRIVACY") {
                 MonoText(
-                    text = "• Zero-Bloat Native Stack: Built with Kotlin, Jetpack Compose, Room SQLite, WorkManager, and native HttpURLConnection.",
+                    text = "- Zero-Bloat Native Stack: Built with Kotlin, Jetpack Compose, Room SQLite, WorkManager, and native HttpURLConnection.",
                     color = palette.foreground,
                     fontSizeSp = 12
                 )
                 Spacer(modifier = Modifier.height(4.dp))
                 MonoText(
-                    text = "• Share-Sheet Importer & ABB Verification: Share any Audible URL directly into NocturneTXT to track Series/Author/Book, and verify AudioBookBay availability with strict author + date cutoff guards.",
+                    text = "- Share-Sheet Importer & ABB Verification: Share any Audible URL directly into NocturneTXT to track Series/Author/Book, and verify AudioBookBay availability with strict author + date cutoff guards.",
                     color = palette.foreground,
                     fontSizeSp = 12
                 )

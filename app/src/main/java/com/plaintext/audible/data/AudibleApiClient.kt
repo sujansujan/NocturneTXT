@@ -145,9 +145,22 @@ object AudibleApiClient {
     }
 
     /**
-     * Parses shared text from Android's share sheet (Audible app, Goodreads, or browser URL)
-     * into an optional 10-character ASIN and a human-readable fallback search query.
+     * Strict person-name matcher that normalizes punctuation and spacing
+     * (e.g., "C. Mantis" matches "C Mantis" or "C. Mantis", never "Mantis" or "C. M. Mantis").
      */
+    fun isExactAuthorNameMatch(candidateName: String, targetName: String): Boolean {
+        val c = cleanContributorName(candidateName)
+            .lowercase(Locale.US)
+            .replace(Regex("[^a-z0-9]+"), " ")
+            .trim()
+        val t = cleanContributorName(targetName)
+            .lowercase(Locale.US)
+            .replace(Regex("[^a-z0-9]+"), " ")
+            .trim()
+        if (c.isBlank() || t.isBlank()) return false
+        return c == t
+    }
+
     fun extractSharedAsinOrQuery(sharedText: String): Pair<String?, String> {
         val trimmed = sharedText.trim()
         if (trimmed.isBlank()) return null to ""
@@ -180,11 +193,6 @@ object AudibleApiClient {
         return rawAsin to fallbackQuery
     }
 
-    /**
-     * Resolves shared text or URL into matching Audible catalog products.
-     * Tries exact ASIN lookup first; if the ASIN is a series/author container ASIN or not a direct
-     * product ASIN, falls back to a keyword catalog search using the extracted slug/title.
-     */
     suspend fun resolveSharedInput(sharedText: String): SharedImportResolution = withContext(Dispatchers.IO) {
         val (asin, query) = extractSharedAsinOrQuery(sharedText)
         val results = LinkedHashMap<String, CatalogProduct>()
@@ -481,6 +489,11 @@ object AudibleApiClient {
         CacheStats(0, 0L)
     }
 
+    /**
+     * Fetches the verified author portrait URL from Audnexus or Audible's author page.
+     * Strictly verifies that the returned author `name` matches `authorName` (punctuation-normalized)
+     * so fuzzy search hits never attach another author's photo or book cover (fixes C. Mantis).
+     */
     suspend fun fetchAudibleAuthorImageUrl(
         authorName: String,
         knownAuthorAsin: String? = null
@@ -488,7 +501,7 @@ object AudibleApiClient {
         val cleaned = cleanContributorName(authorName)
         if (cleaned.isBlank()) return@withContext null
 
-        val cacheKey = "audible_author:${cleaned.lowercase(Locale.US)}"
+        val cacheKey = "audible_author_v31:${cleaned.lowercase(Locale.US)}"
         personPortraitCache.get(cacheKey)?.let { cached ->
             if (cached.isNotBlank()) return@withContext cached
         }
@@ -501,10 +514,13 @@ object AudibleApiClient {
         if (audnexSearchJson != null) {
             runCatching {
                 val arr = JSONArray(audnexSearchJson)
-                for (i in 0 until arr.length().coerceAtMost(5)) {
+                for (i in 0 until arr.length().coerceAtMost(8)) {
                     val obj = arr.optJSONObject(i) ?: continue
+                    val returnedName = obj.optString("name", "").trim()
+                    if (!isExactAuthorNameMatch(returnedName, cleaned)) continue
+
                     val directImg = obj.optString("image", "").trim()
-                    if (directImg.startsWith("https://")) {
+                    if (isValidAudibleAuthorPortraitUrl(directImg)) {
                         personPortraitCache.put(cacheKey, directImg)
                         return@withContext directImg
                     }
@@ -515,7 +531,7 @@ object AudibleApiClient {
         }
 
         if (candidateAsins.isEmpty()) {
-            val searchUrl = URL("$BASE_URL?author=$encodedName&num_results=10&response_groups=contributors")
+            val searchUrl = URL("$BASE_URL?author=$encodedName&num_results=15&response_groups=contributors")
             val searchJson = executeGetWithRetry(searchUrl)
             if (searchJson != null) {
                 runCatching {
@@ -527,11 +543,7 @@ object AudibleApiClient {
                                 val aObj = authors.optJSONObject(j) ?: continue
                                 val aName = cleanContributorName(aObj.optString("name", ""))
                                 val asin = aObj.optString("asin", "").trim()
-                                if (asin.isNotBlank() &&
-                                    (aName.equals(cleaned, ignoreCase = true) ||
-                                        aName.contains(cleaned, ignoreCase = true) ||
-                                        cleaned.contains(aName, ignoreCase = true))
-                                ) {
+                                if (asin.isNotBlank() && isExactAuthorNameMatch(aName, cleaned)) {
                                     candidateAsins.add(asin)
                                 }
                             }
@@ -541,26 +553,19 @@ object AudibleApiClient {
             }
         }
 
-        if (candidateAsins.isEmpty()) {
-            val webSearchUrl = URL(
-                "https://www.audible.com/search?searchAuthor=$encodedName&ipRedirectOverride=true&overrideBaseCountry=true"
-            )
-            val searchHtml = executeGetWithRetry(webSearchUrl, acceptHtml = true)
-            if (searchHtml != null) {
-                val asinRegex = Regex("/author/(?:[^/\"'?]+/)?(B[A-Z0-9]{9})")
-                asinRegex.findAll(searchHtml).take(3).forEach { m ->
-                    m.groupValues.getOrNull(1)?.takeIf { it.isNotBlank() }?.let { candidateAsins.add(it) }
-                }
-            }
-        }
-
         for (authorAsin in candidateAsins) {
             val audnexProfileJson = executeGetWithRetry(URL("https://api.audnex.us/authors/$authorAsin?region=us"))
             if (audnexProfileJson != null) {
                 val img = runCatching {
-                    JSONObject(audnexProfileJson).optString("image", "").trim()
+                    val obj = JSONObject(audnexProfileJson)
+                    val profileName = obj.optString("name", "").trim()
+                    if (profileName.isNotBlank() && !isExactAuthorNameMatch(profileName, cleaned)) {
+                        ""
+                    } else {
+                        obj.optString("image", "").trim()
+                    }
                 }.getOrDefault("")
-                if (img.startsWith("https://")) {
+                if (isValidAudibleAuthorPortraitUrl(img)) {
                     personPortraitCache.put(cacheKey, img)
                     return@withContext img
                 }
@@ -572,7 +577,7 @@ object AudibleApiClient {
             val html = executeGetWithRetry(authorPageUrl, acceptHtml = true)
             if (html != null) {
                 val extracted = extractAuthorImageFromAudibleHtml(html)
-                if (extracted.startsWith("https://")) {
+                if (isValidAudibleAuthorPortraitUrl(extracted)) {
                     personPortraitCache.put(cacheKey, extracted)
                     return@withContext extracted
                 }
@@ -776,7 +781,7 @@ object AudibleApiClient {
                     if (acceptHtml) {
                         "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
                     } else {
-                        "NocturneTXT/3.0 (Android)"
+                        "NocturneTXT/3.1 (Android)"
                     }
                 )
             }
