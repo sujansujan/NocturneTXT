@@ -12,8 +12,8 @@ android {
         applicationId = "com.plaintext.audible"
         minSdk = 26
         targetSdk = 34
-        versionCode = 21
-        versionName = "3.1.0"
+        versionCode = 22
+        versionName = "3.1.1"
     }
 
     buildTypes {
@@ -37,6 +37,7 @@ android {
     }
     buildFeatures {
         compose = true
+        buildConfig = true
     }
     composeOptions {
         kotlinCompilerExtensionVersion = "1.5.14"

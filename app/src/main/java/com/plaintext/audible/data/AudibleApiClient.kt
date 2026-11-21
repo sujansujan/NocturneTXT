@@ -3,6 +3,7 @@ package com.plaintext.audible.data
 import android.util.LruCache
 import androidx.compose.runtime.Immutable
 import androidx.core.text.HtmlCompat
+import com.plaintext.audible.BuildConfig
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
@@ -13,6 +14,7 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLDecoder
 import java.net.URLEncoder
+import java.security.MessageDigest
 import java.time.LocalDate
 import java.time.format.DateTimeFormatter
 import java.time.format.DateTimeFormatterBuilder
@@ -74,7 +76,6 @@ data class CacheStats(
 }
 
 object AudibleApiClient {
-    private const val BASE_URL = "https://api.audible.com/1.0/catalog/products"
     private const val RESPONSE_GROUPS =
         "contributors,product_attrs,product_desc,product_extended_attrs,series,relationships,media"
     private const val IMAGE_SIZES = "252,500"
@@ -82,6 +83,29 @@ object AudibleApiClient {
     private const val PRUNE_MAX_AGE_MS = 30L * 24L * 60L * 60L * 1000L
     private const val PRUNE_MAX_BYTES = 15L * 1024L * 1024L
     private const val CACHE_DIR_NAME = "audible_catalog_json_v26"
+
+    @Volatile
+    var activeMarketplace: AudibleMarketplace = AudibleMarketplace.US
+
+    private fun catalogBaseUrl(marketplace: AudibleMarketplace = activeMarketplace): String =
+        "https://api.${marketplace.domain}/1.0/catalog/products"
+
+    private fun audnexRegion(marketplace: AudibleMarketplace = activeMarketplace): String =
+        marketplace.code.lowercase(Locale.US)
+
+    fun cacheKeyHash(input: String): String {
+        return runCatching {
+            val digest = MessageDigest.getInstance("SHA-256")
+                .digest(input.toByteArray(Charsets.UTF_8))
+            buildString(16) {
+                for (i in 0 until 8) {
+                    val b = digest[i].toInt() and 0xFF
+                    append("0123456789abcdef"[b ushr 4])
+                    append("0123456789abcdef"[b and 0x0F])
+                }
+            }
+        }.getOrElse { input.hashCode().toUInt().toString(16) }
+    }
 
     private val ABB_MIRRORS = listOf(
         "https://audiobookbay.lu",
@@ -510,28 +534,35 @@ object AudibleApiClient {
         knownAuthorAsin?.trim()?.takeIf { it.isNotBlank() }?.let { candidateAsins.add(it) }
 
         val encodedName = URLEncoder.encode(cleaned, "UTF-8")
-        val audnexSearchJson = executeGetWithRetry(URL("https://api.audnex.us/authors?name=$encodedName&region=us"))
-        if (audnexSearchJson != null) {
-            runCatching {
-                val arr = JSONArray(audnexSearchJson)
-                for (i in 0 until arr.length().coerceAtMost(8)) {
-                    val obj = arr.optJSONObject(i) ?: continue
-                    val returnedName = obj.optString("name", "").trim()
-                    if (!isExactAuthorNameMatch(returnedName, cleaned)) continue
+        val primaryRegion = audnexRegion()
+        val regionsToTry = if (primaryRegion == "us") listOf("us") else listOf(primaryRegion, "us")
 
-                    val directImg = obj.optString("image", "").trim()
-                    if (isValidAudibleAuthorPortraitUrl(directImg)) {
-                        personPortraitCache.put(cacheKey, directImg)
-                        return@withContext directImg
+        for (region in regionsToTry) {
+            val audnexSearchJson = executeGetWithRetry(URL("https://api.audnex.us/authors?name=$encodedName&region=$region"))
+            if (audnexSearchJson != null) {
+                runCatching {
+                    val arr = JSONArray(audnexSearchJson)
+                    for (i in 0 until arr.length().coerceAtMost(8)) {
+                        val obj = arr.optJSONObject(i) ?: continue
+                        val returnedName = obj.optString("name", "").trim()
+                        if (!isExactAuthorNameMatch(returnedName, cleaned)) continue
+
+                        val directImg = obj.optString("image", "").trim()
+                        if (isValidAudibleAuthorPortraitUrl(directImg)) {
+                            personPortraitCache.put(cacheKey, directImg)
+                            return@withContext directImg
+                        }
+                        val asin = obj.optString("asin", "").trim()
+                        if (asin.isNotBlank()) candidateAsins.add(asin)
                     }
-                    val asin = obj.optString("asin", "").trim()
-                    if (asin.isNotBlank()) candidateAsins.add(asin)
                 }
             }
+            if (candidateAsins.isNotEmpty()) break
         }
 
         if (candidateAsins.isEmpty()) {
-            val searchUrl = URL("$BASE_URL?author=$encodedName&num_results=15&response_groups=contributors")
+            val baseUrl = catalogBaseUrl()
+            val searchUrl = URL("$baseUrl?author=$encodedName&num_results=15&response_groups=contributors")
             val searchJson = executeGetWithRetry(searchUrl)
             if (searchJson != null) {
                 runCatching {
@@ -553,26 +584,29 @@ object AudibleApiClient {
             }
         }
 
+        val marketDomain = activeMarketplace.domain
         for (authorAsin in candidateAsins) {
-            val audnexProfileJson = executeGetWithRetry(URL("https://api.audnex.us/authors/$authorAsin?region=us"))
-            if (audnexProfileJson != null) {
-                val img = runCatching {
-                    val obj = JSONObject(audnexProfileJson)
-                    val profileName = obj.optString("name", "").trim()
-                    if (profileName.isNotBlank() && !isExactAuthorNameMatch(profileName, cleaned)) {
-                        ""
-                    } else {
-                        obj.optString("image", "").trim()
+            for (region in regionsToTry) {
+                val audnexProfileJson = executeGetWithRetry(URL("https://api.audnex.us/authors/$authorAsin?region=$region"))
+                if (audnexProfileJson != null) {
+                    val img = runCatching {
+                        val obj = JSONObject(audnexProfileJson)
+                        val profileName = obj.optString("name", "").trim()
+                        if (profileName.isNotBlank() && !isExactAuthorNameMatch(profileName, cleaned)) {
+                            ""
+                        } else {
+                            obj.optString("image", "").trim()
+                        }
+                    }.getOrDefault("")
+                    if (isValidAudibleAuthorPortraitUrl(img)) {
+                        personPortraitCache.put(cacheKey, img)
+                        return@withContext img
                     }
-                }.getOrDefault("")
-                if (isValidAudibleAuthorPortraitUrl(img)) {
-                    personPortraitCache.put(cacheKey, img)
-                    return@withContext img
                 }
             }
 
             val authorPageUrl = URL(
-                "https://www.audible.com/author/$authorAsin?ipRedirectOverride=true&overrideBaseCountry=true"
+                "https://www.$marketDomain/author/$authorAsin?ipRedirectOverride=true&overrideBaseCountry=true"
             )
             val html = executeGetWithRetry(authorPageUrl, acceptHtml = true)
             if (html != null) {
@@ -678,7 +712,8 @@ object AudibleApiClient {
             baseParams += "keywords=${URLEncoder.encode(it.trim(), "UTF-8")}"
         }
 
-        val combinedKey = "$BASE_URL?${baseParams.joinToString("&")}&maxPages=$maxPages"
+        val baseUrl = catalogBaseUrl()
+        val combinedKey = "$baseUrl?${baseParams.joinToString("&")}&maxPages=$maxPages"
         if (!forceRefresh) {
             memoryCache.get(combinedKey)?.let { return@withContext it }
         }
@@ -687,7 +722,7 @@ object AudibleApiClient {
         val accumulated = LinkedHashMap<String, CatalogProduct>()
 
         for (page in 0 until maxPages.coerceAtLeast(1)) {
-            val pageUrlStr = "$BASE_URL?${baseParams.joinToString("&")}&page=$page"
+            val pageUrlStr = "$baseUrl?${baseParams.joinToString("&")}&page=$page"
             val jsonStr = fetchWithDiskCache(pageUrlStr, forceRefresh) ?: break
             val rootObj = runCatching { JSONObject(jsonStr) }.getOrNull() ?: break
             val rawProductsArr = rootObj.optJSONArray("products") ?: break
@@ -712,12 +747,12 @@ object AudibleApiClient {
     }
 
     private suspend fun fetchByAsin(asin: String, forceRefresh: Boolean): List<CatalogProduct> {
-        val urlStr = "$BASE_URL/$asin?response_groups=$RESPONSE_GROUPS&image_sizes=$IMAGE_SIZES"
+        val urlStr = "${catalogBaseUrl()}/$asin?response_groups=$RESPONSE_GROUPS&image_sizes=$IMAGE_SIZES"
         if (!forceRefresh) {
             memoryCache.get(urlStr)?.let { return it }
         }
         val jsonStr = fetchWithDiskCache(urlStr, forceRefresh) ?: return emptyList()
-        val root = JSONObject(jsonStr)
+        val root = runCatching { JSONObject(jsonStr) }.getOrNull() ?: return emptyList()
         val prodObj = root.optJSONObject("product") ?: return emptyList()
         val parsed = listOfNotNull(parseProductObject(prodObj))
         if (parsed.isNotEmpty()) {
@@ -728,7 +763,7 @@ object AudibleApiClient {
 
     private suspend fun fetchWithDiskCache(urlStr: String, forceRefresh: Boolean): String? {
         val dir = diskCacheDir
-        val cacheFile = dir?.let { File(it, urlStr.hashCode().toUInt().toString(16) + ".json") }
+        val cacheFile = dir?.let { File(it, cacheKeyHash(urlStr) + ".json") }
 
         if (!forceRefresh && cacheFile != null && cacheFile.exists()) {
             val ageMs = System.currentTimeMillis() - cacheFile.lastModified()
@@ -781,7 +816,7 @@ object AudibleApiClient {
                     if (acceptHtml) {
                         "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
                     } else {
-                        "NocturneTXT/3.1 (Android)"
+                        "NocturneTXT/${BuildConfig.VERSION_NAME} (Android)"
                     }
                 )
             }

@@ -4,6 +4,8 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.provider.Settings
 import android.util.LruCache
+import androidx.compose.animation.animateContentSize
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -26,9 +28,11 @@ import androidx.compose.ui.graphics.FilterQuality
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
@@ -44,6 +48,8 @@ import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.plaintext.audible.BuildConfig
+import com.plaintext.audible.data.AudibleApiClient
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
@@ -98,9 +104,9 @@ fun BoxWithConstraintsScope.rememberAsciiCols(
 ): Int = rememberAsciiMetrics(fontSizeSp, bold).cols
 
 @Composable
-fun rememberAsciiSpinner(active: Boolean): String {
+fun rememberAnimationsEnabled(): Boolean {
     val context = LocalContext.current
-    val animate = remember {
+    return remember(context) {
         runCatching {
             Settings.Global.getFloat(
                 context.contentResolver,
@@ -109,6 +115,11 @@ fun rememberAsciiSpinner(active: Boolean): String {
             ) != 0f
         }.getOrDefault(true)
     }
+}
+
+@Composable
+fun rememberAsciiSpinner(active: Boolean): String {
+    val animate = rememberAnimationsEnabled()
     val frames = remember { arrayOf("|", "/", "-", "\\") }
     var idx by remember { mutableIntStateOf(0) }
     LaunchedEffect(active, animate) {
@@ -157,13 +168,17 @@ fun CoverThumbnail(
             if (coverUrl.isNotBlank()) ThumbnailCache.memory.get(coverUrl) else null
         )
     }
+    var isLoading by remember(coverUrl) {
+        mutableStateOf(coverUrl.isNotBlank() && imageBitmap == null)
+    }
 
     if (coverUrl.isNotBlank() && imageBitmap == null) {
         LaunchedEffect(coverUrl) {
+            isLoading = true
             val loaded = withContext(Dispatchers.IO) {
                 try {
                     val cacheDir = File(context.cacheDir, "covers").apply { mkdirs() }
-                    val cacheFile = File(cacheDir, coverUrl.hashCode().toUInt().toString(16) + ".jpg")
+                    val cacheFile = File(cacheDir, AudibleApiClient.cacheKeyHash(coverUrl) + ".jpg")
 
                     if (cacheFile.exists() && cacheFile.length() > 0) {
                         val bytes = cacheFile.readBytes()
@@ -172,15 +187,36 @@ fun CoverThumbnail(
                         val conn = (URL(coverUrl).openConnection() as HttpURLConnection).apply {
                             connectTimeout = 8_000
                             readTimeout = 8_000
-                            setRequestProperty("User-Agent", "NocturneTXT/3.1 (Android)")
+                            setRequestProperty("User-Agent", "NocturneTXT/${BuildConfig.VERSION_NAME} (Android)")
                         }
                         try {
                             if (conn.responseCode in 200..299) {
                                 val rawBytes = conn.inputStream.readBytes()
-                                val decoded = BitmapFactory.decodeByteArray(rawBytes, 0, rawBytes.size)
+                                val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                                BitmapFactory.decodeByteArray(rawBytes, 0, rawBytes.size, bounds)
+                                var sampleSize = 1
+                                val minOrig = minOf(bounds.outWidth, bounds.outHeight)
+                                while (minOrig > 0 && (minOrig / sampleSize) >= 360) {
+                                    sampleSize *= 2
+                                }
+                                val decodeOpts = BitmapFactory.Options().apply { inSampleSize = sampleSize }
+                                val decoded = BitmapFactory.decodeByteArray(rawBytes, 0, rawBytes.size, decodeOpts)
                                 if (decoded != null) {
-                                    val scaled = if (decoded.width > 160 || decoded.height > 160) {
-                                        Bitmap.createScaledBitmap(decoded, 160, 160, true)
+                                    val w = decoded.width.coerceAtLeast(1)
+                                    val h = decoded.height.coerceAtLeast(1)
+                                    val minDim = minOf(w, h)
+                                    val maxDim = maxOf(w, h)
+                                    val scale = when {
+                                        minDim > 180 -> minOf(180f / minDim.toFloat(), 360f / maxDim.toFloat())
+                                        maxDim > 360 -> 360f / maxDim.toFloat()
+                                        else -> 1f
+                                    }
+                                    val scaled = if (scale < 1f) {
+                                        val targetW = (w * scale).roundToInt().coerceAtLeast(1)
+                                        val targetH = (h * scale).roundToInt().coerceAtLeast(1)
+                                        Bitmap.createScaledBitmap(decoded, targetW, targetH, true).also {
+                                            if (it !== decoded) decoded.recycle()
+                                        }
                                     } else {
                                         decoded
                                     }
@@ -204,6 +240,7 @@ fun CoverThumbnail(
                 ThumbnailCache.memory.put(coverUrl, loaded)
                 imageBitmap = loaded
             }
+            isLoading = false
         }
     }
 
@@ -220,12 +257,12 @@ fun CoverThumbnail(
                 bitmap = bmp,
                 contentDescription = null,
                 contentScale = ContentScale.Crop,
-                filterQuality = FilterQuality.Low,
+                filterQuality = FilterQuality.Medium,
                 modifier = Modifier.fillMaxSize()
             )
         } else {
             Text(
-                text = fallbackText,
+                text = if (isLoading) "[...]" else fallbackText,
                 fontFamily = FontFamily.Monospace,
                 fontSize = 10.sp,
                 color = borderColor,
@@ -286,8 +323,14 @@ fun AsciiSectionHeader(
     ) {
         val cols = rememberAsciiCols(fontSizeSp = 12, bold = true)
         val clean = title.uppercase().trim()
-        val prefix = "+=== $clean "
-        val padCount = (cols - prefix.length - 1).coerceAtLeast(3)
+        val maxTitleLen = (cols - 10).coerceAtLeast(6)
+        val displayTitle = if (clean.length > maxTitleLen) {
+            clean.take((maxTitleLen - 2).coerceAtLeast(4)) + ".."
+        } else {
+            clean
+        }
+        val prefix = "+=== $displayTitle "
+        val padCount = (cols - prefix.length - 1).coerceAtLeast(2)
         val line = prefix + "=".repeat(padCount) + "+"
 
         Text(
@@ -408,6 +451,7 @@ fun AsciiToggleRow(
     modifier: Modifier = Modifier
 ) {
     val palette = LocalPtsPalette.current
+    val haptic = LocalHapticFeedback.current
     val interactionSource = remember { MutableInteractionSource() }
     val isPressed by interactionSource.collectIsPressedAsState()
 
@@ -419,13 +463,16 @@ fun AsciiToggleRow(
         contentAlignment = Alignment.CenterStart,
         modifier = modifier
             .fillMaxWidth()
-            .defaultMinSize(minHeight = 38.dp)
+            .defaultMinSize(minHeight = 40.dp)
             .background(rowBg)
             .clickable(
                 interactionSource = interactionSource,
                 indication = null,
                 role = Role.Checkbox,
-                onClick = onToggle
+                onClick = {
+                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                    onToggle()
+                }
             )
             .padding(vertical = 3.dp)
             .clearAndSetSemantics {
@@ -434,12 +481,18 @@ fun AsciiToggleRow(
     ) {
         val cols = rememberAsciiCols(fontSizeSp = 12, bold = false)
         val cleanLabel = label.trim()
-        val dotCount = (cols - cleanLabel.length - stateToken.length - 2).coerceAtLeast(2)
+        val maxLabelLen = (cols - stateToken.length - 4).coerceAtLeast(6)
+        val displayLabel = if (cleanLabel.length > maxLabelLen) {
+            cleanLabel.take((maxLabelLen - 2).coerceAtLeast(4)) + ".."
+        } else {
+            cleanLabel
+        }
+        val dotCount = (cols - displayLabel.length - stateToken.length - 2).coerceAtLeast(2)
         val dots = ".".repeat(dotCount)
 
         val annotated = buildAnnotatedString {
             withStyle(SpanStyle(color = palette.foreground, fontWeight = FontWeight.Normal)) {
-                append(cleanLabel)
+                append(displayLabel)
             }
             withStyle(SpanStyle(color = palette.comment.copy(alpha = 0.38f), fontWeight = FontWeight.Normal)) {
                 append(" $dots ")
@@ -473,6 +526,7 @@ fun AsciiRadioButton(
     activeColor: Color = LocalPtsPalette.current.cyan
 ) {
     val palette = LocalPtsPalette.current
+    val haptic = LocalHapticFeedback.current
     val interactionSource = remember { MutableInteractionSource() }
     val isPressed by interactionSource.collectIsPressedAsState()
 
@@ -483,15 +537,18 @@ fun AsciiRadioButton(
     Box(
         contentAlignment = Alignment.CenterStart,
         modifier = modifier
-            .defaultMinSize(minHeight = 34.dp)
+            .defaultMinSize(minHeight = 38.dp)
             .background(if (isPressed) ink else Color.Transparent)
             .clickable(
                 interactionSource = interactionSource,
                 indication = null,
                 role = Role.RadioButton,
-                onClick = onClick
+                onClick = {
+                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                    onClick()
+                }
             )
-            .padding(horizontal = 4.dp, vertical = 3.dp)
+            .padding(horizontal = 6.dp, vertical = 4.dp)
             .clearAndSetSemantics {
                 contentDescription = "$label, ${if (selected) "selected" else "not selected"}"
             }
@@ -516,9 +573,12 @@ fun AsciiInvertButton(
     active: Boolean,
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
-    color: Color = LocalPtsPalette.current.purple
+    color: Color = LocalPtsPalette.current.purple,
+    fontSizeSp: Int = 12,
+    hapticType: HapticFeedbackType? = HapticFeedbackType.TextHandleMove
 ) {
     val palette = LocalPtsPalette.current
+    val haptic = LocalHapticFeedback.current
     val interactionSource = remember { MutableInteractionSource() }
     val isPressed by interactionSource.collectIsPressedAsState()
 
@@ -529,15 +589,20 @@ fun AsciiInvertButton(
     Box(
         contentAlignment = Alignment.Center,
         modifier = modifier
-            .defaultMinSize(minHeight = 32.dp)
+            .defaultMinSize(minHeight = 36.dp)
             .background(bgColor)
             .clickable(
                 interactionSource = interactionSource,
                 indication = null,
                 role = Role.Button,
-                onClick = onClick
+                onClick = {
+                    if (hapticType != null) {
+                        haptic.performHapticFeedback(hapticType)
+                    }
+                    onClick()
+                }
             )
-            .padding(horizontal = 6.dp, vertical = 3.dp)
+            .padding(horizontal = 6.dp, vertical = 4.dp)
             .clearAndSetSemantics {
                 contentDescription = "$label${if (active) ", active" else ""}"
             }
@@ -545,7 +610,7 @@ fun AsciiInvertButton(
         Text(
             text = if (active) " $label " else "[$label]",
             fontFamily = FontFamily.Monospace,
-            fontSize = 12.sp,
+            fontSize = fontSizeSp.sp,
             fontWeight = if (inverted) FontWeight.Bold else FontWeight.Medium,
             color = fgColor,
             softWrap = false,
@@ -564,6 +629,7 @@ fun AsciiTextField(
     modifier: Modifier = Modifier
 ) {
     val palette = LocalPtsPalette.current
+    val haptic = LocalHapticFeedback.current
     var isFocused by remember { mutableStateOf(false) }
     val borderColor = if (isFocused) palette.cyan else palette.comment
 
@@ -616,6 +682,27 @@ fun AsciiTextField(
                     .onFocusChanged { isFocused = it.isFocused }
             )
         }
+        if (value.isNotEmpty()) {
+            Spacer(modifier = Modifier.width(6.dp))
+            Text(
+                text = "[x]",
+                fontFamily = FontFamily.Monospace,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Bold,
+                color = palette.comment,
+                style = TextStyle(fontFeatureSettings = MONO_FONT_FEATURES),
+                modifier = Modifier
+                    .clickable(
+                        role = Role.Button,
+                        onClick = {
+                            haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                            onValueChange("")
+                        }
+                    )
+                    .padding(horizontal = 4.dp, vertical = 2.dp)
+                    .clearAndSetSemantics { contentDescription = "Clear input" }
+            )
+        }
     }
 }
 
@@ -627,13 +714,16 @@ fun AsciiTextField(
 fun AsciiBox(
     modifier: Modifier = Modifier,
     headerLabel: String? = null,
+    trailingHeaderBadge: String? = null,
     borderColor: Color = LocalPtsPalette.current.comment,
     headerColor: Color = LocalPtsPalette.current.purple,
+    animateSizeChange: Boolean = false,
     onClick: (() -> Unit)? = null,
     content: @Composable ColumnScope.() -> Unit
 ) {
     val palette = LocalPtsPalette.current
     val density = LocalDensity.current
+    val animationsEnabled = rememberAnimationsEnabled()
     val clickableModifier = if (onClick != null) {
         modifier
             .fillMaxWidth()
@@ -649,17 +739,7 @@ fun AsciiBox(
         val cols = metrics.cols
         val cellPx = metrics.cellWidthPx
 
-        val topLine = remember(headerLabel, cols) {
-            if (!headerLabel.isNullOrBlank()) {
-                val cleanHeader = headerLabel.trim()
-                val prefix = "+---[ $cleanHeader ]"
-                val padCount = (cols - prefix.length - 1).coerceAtLeast(2)
-                prefix + "-".repeat(padCount) + "+"
-            } else {
-                "+" + "-".repeat((cols - 2).coerceAtLeast(2)) + "+"
-            }
-        }
-        val bottomLine = remember(cols) {
+        val plainLine = remember(cols) {
             "+" + "-".repeat((cols - 2).coerceAtLeast(2)) + "+"
         }
 
@@ -669,8 +749,16 @@ fun AsciiBox(
         Column(modifier = Modifier.fillMaxWidth()) {
             if (!headerLabel.isNullOrBlank()) {
                 val cleanHeader = headerLabel.trim()
-                val bracketTitle = "[ $cleanHeader ]"
-                val dashRightCount = (cols - 4 - bracketTitle.length - 1).coerceAtLeast(2)
+                val badgeToken = trailingHeaderBadge?.trim()?.takeIf { it.isNotEmpty() }?.let { "[$it]" }
+                val suffixLen = if (badgeToken != null) badgeToken.length + 2 else 1 // "[$b]-+" vs "+"
+                val maxHeaderLen = (cols - 10 - suffixLen).coerceAtLeast(6)
+                val displayHeader = if (cleanHeader.length > maxHeaderLen) {
+                    cleanHeader.take((maxHeaderLen - 2).coerceAtLeast(4)) + ".."
+                } else {
+                    cleanHeader
+                }
+                val bracketTitle = "[ $displayHeader ]"
+                val dashRightCount = (cols - 4 - bracketTitle.length - suffixLen).coerceAtLeast(2)
                 val annotatedTop = buildAnnotatedString {
                     withStyle(SpanStyle(color = borderColor, fontWeight = FontWeight.Bold)) {
                         append("+---")
@@ -679,7 +767,19 @@ fun AsciiBox(
                         append(bracketTitle)
                     }
                     withStyle(SpanStyle(color = borderColor, fontWeight = FontWeight.Bold)) {
-                        append("-".repeat(dashRightCount) + "+")
+                        append("-".repeat(dashRightCount))
+                    }
+                    if (badgeToken != null) {
+                        withStyle(SpanStyle(color = palette.comment, fontWeight = FontWeight.Bold)) {
+                            append(badgeToken)
+                        }
+                        withStyle(SpanStyle(color = borderColor, fontWeight = FontWeight.Bold)) {
+                            append("-+")
+                        }
+                    } else {
+                        withStyle(SpanStyle(color = borderColor, fontWeight = FontWeight.Bold)) {
+                            append("+")
+                        }
                     }
                 }
                 Text(
@@ -696,7 +796,7 @@ fun AsciiBox(
                 )
             } else {
                 Text(
-                    text = topLine,
+                    text = plainLine,
                     fontFamily = FontFamily.Monospace,
                     fontSize = 12.sp,
                     fontWeight = FontWeight.Bold,
@@ -711,31 +811,40 @@ fun AsciiBox(
                 )
             }
 
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .drawBehind {
-                        val strokePx = with(density) { 1.25.dp.toPx() }
-                        val rx = rightRailX.coerceAtMost(size.width - strokePx)
-                        drawLine(
-                            color = borderColor,
-                            start = Offset(leftRailX, 0f),
-                            end = Offset(leftRailX, size.height),
-                            strokeWidth = strokePx
-                        )
-                        drawLine(
-                            color = borderColor,
-                            start = Offset(rx, 0f),
-                            end = Offset(rx, size.height),
-                            strokeWidth = strokePx
-                        )
+            val bodyModifier = Modifier
+                .fillMaxWidth()
+                .then(
+                    if (animateSizeChange && animationsEnabled) {
+                        Modifier.animateContentSize(animationSpec = tween(durationMillis = 140))
+                    } else {
+                        Modifier
                     }
-                    .padding(horizontal = 12.dp, vertical = 6.dp),
+                )
+                .drawBehind {
+                    val strokePx = with(density) { 1.25.dp.toPx() }
+                    val rx = rightRailX.coerceAtMost(size.width - strokePx)
+                    drawLine(
+                        color = borderColor,
+                        start = Offset(leftRailX, 0f),
+                        end = Offset(leftRailX, size.height),
+                        strokeWidth = strokePx
+                    )
+                    drawLine(
+                        color = borderColor,
+                        start = Offset(rx, 0f),
+                        end = Offset(rx, size.height),
+                        strokeWidth = strokePx
+                    )
+                }
+                .padding(horizontal = 12.dp, vertical = 6.dp)
+
+            Column(
+                modifier = bodyModifier,
                 content = content
             )
 
             Text(
-                text = bottomLine,
+                text = plainLine,
                 fontFamily = FontFamily.Monospace,
                 fontSize = 12.sp,
                 fontWeight = FontWeight.Bold,
@@ -761,9 +870,11 @@ fun BracketButton(
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
     color: Color = LocalPtsPalette.current.cyan,
-    active: Boolean = false
+    active: Boolean = false,
+    hapticType: HapticFeedbackType? = HapticFeedbackType.TextHandleMove
 ) {
     val palette = LocalPtsPalette.current
+    val haptic = LocalHapticFeedback.current
     val interactionSource = remember { MutableInteractionSource() }
     val isPressed by interactionSource.collectIsPressedAsState()
 
@@ -775,17 +886,22 @@ fun BracketButton(
     }
 
     Box(
-        contentAlignment = Alignment.CenterStart,
+        contentAlignment = Alignment.Center,
         modifier = modifier
-            .defaultMinSize(minHeight = 34.dp)
+            .defaultMinSize(minWidth = 38.dp, minHeight = 38.dp)
             .background(if (isPressed) ink else Color.Transparent)
             .clickable(
                 interactionSource = interactionSource,
                 indication = null,
                 role = Role.Button,
-                onClick = onClick
+                onClick = {
+                    if (hapticType != null) {
+                        haptic.performHapticFeedback(hapticType)
+                    }
+                    onClick()
+                }
             )
-            .padding(horizontal = 4.dp, vertical = 3.dp)
+            .padding(horizontal = 6.dp, vertical = 4.dp)
             .clearAndSetSemantics { contentDescription = label }
     ) {
         Text(

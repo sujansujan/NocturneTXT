@@ -10,7 +10,9 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.withPermit
 import java.time.Instant
 import java.time.LocalDate
@@ -80,7 +82,6 @@ data class FilterPrefs(
     val englishOnly: Boolean = true,
     val hideAbridged: Boolean = true,
     val hideDramatized: Boolean = false,
-    val enableDirectAdd: Boolean = false,
     val alwaysShowCardActions: Boolean = false,
     val checkAbbDaily: Boolean = true,
     val hideCoverArt: Boolean = false,
@@ -101,64 +102,141 @@ class ReleaseRepository(context: Context) {
     val dao = db.dao()
     private val prefs: SharedPreferences =
         context.getSharedPreferences("pts_audible_prefs", Context.MODE_PRIVATE)
+    private val syncMutex = Mutex()
     private val syncSemaphore = Semaphore(4)
     private val abbSemaphore = Semaphore(1)
 
     private val _syncProgress = MutableStateFlow(SyncProgressState())
     val syncProgress: StateFlow<SyncProgressState> = _syncProgress.asStateFlow()
 
+    private val _isSyncing = MutableStateFlow(false)
+    val isSyncing: StateFlow<Boolean> = _isSyncing.asStateFlow()
+
+    private val _prefsFlow = MutableStateFlow(readPrefs())
+    val prefsFlow: StateFlow<FilterPrefs> = _prefsFlow.asStateFlow()
+
+    private val _telemetryFlow = MutableStateFlow(readSyncTelemetry())
+    val telemetryFlow: StateFlow<SyncTelemetry> = _telemetryFlow.asStateFlow()
+
     companion object {
         private const val ABB_DAILY_INTERVAL_MS = 20L * 60L * 60L * 1000L
+
+        fun matchesPersonNameExactOrWordBoundary(candidateName: String, targetQuery: String): Boolean {
+            val cand = candidateName.trim()
+            val target = targetQuery.trim()
+            if (cand.isBlank() || target.isBlank()) return false
+            if (cand.equals(target, ignoreCase = true)) return true
+            if (AudibleApiClient.isExactAuthorNameMatch(cand, target)) return true
+            val escaped = Regex.escape(target)
+            return Regex("\\b$escaped\\b", RegexOption.IGNORE_CASE).containsMatchIn(cand)
+        }
+
+        fun releaseMatchesTrackedItem(rel: ReleaseEntity, item: TrackedItemEntity): Boolean {
+            val q = item.queryValue.trim()
+            val pAsin = item.pinnedAsin
+            val pAuthor = item.pinnedAuthor
+            return when (item.type) {
+                TrackType.SERIES -> {
+                    val asinMatch = pAsin.isNotBlank() &&
+                        rel.seriesAsin.isNotBlank() &&
+                        rel.seriesAsin.equals(pAsin, ignoreCase = true)
+                    val titleMatch = rel.seriesTitle.isNotBlank() && (
+                        rel.seriesTitle.equals(q, ignoreCase = true) ||
+                            rel.seriesTitle.equals("$q Series", ignoreCase = true) ||
+                            rel.seriesTitle.equals("The $q Series", ignoreCase = true) ||
+                            (pAsin.isBlank() && rel.seriesTitle.contains(q, ignoreCase = true))
+                        )
+                    val authorMatch = pAuthor.isBlank() || rel.authors.split(",").any { a ->
+                        matchesPersonNameExactOrWordBoundary(a, pAuthor)
+                    }
+                    asinMatch || (titleMatch && authorMatch)
+                }
+                TrackType.AUTHOR -> rel.authors.split(",").take(2).any { a ->
+                    matchesPersonNameExactOrWordBoundary(a, q)
+                }
+                TrackType.NARRATOR -> rel.narrators.split(",").any { n ->
+                    matchesPersonNameExactOrWordBoundary(n, q)
+                }
+                TrackType.BOOK -> {
+                    val altAsinMatch = pAsin.isNotBlank() && rel.altAsins.split(",").any {
+                        it.trim().equals(pAsin, ignoreCase = true)
+                    }
+                    (pAsin.isNotBlank() && rel.asin.equals(pAsin, ignoreCase = true)) ||
+                        altAsinMatch ||
+                        rel.asin.equals(q, ignoreCase = true) ||
+                        (rel.title.equals(q, ignoreCase = true) &&
+                            (pAuthor.isBlank() || rel.authors.split(",").any { a ->
+                                matchesPersonNameExactOrWordBoundary(a, pAuthor)
+                            }))
+                }
+            }
+        }
     }
 
     init {
         AudibleApiClient.initCache(context.applicationContext.cacheDir)
+        AudibleApiClient.activeMarketplace = _prefsFlow.value.marketplace
     }
 
-    fun getPrefs(): FilterPrefs = FilterPrefs(
+    private fun readPrefs(): FilterPrefs = FilterPrefs(
         englishOnly = prefs.getBoolean("english_only", true),
         hideAbridged = prefs.getBoolean("hide_abridged", true),
         hideDramatized = prefs.getBoolean("hide_dramatized", false),
-        enableDirectAdd = prefs.getBoolean("enable_direct_add", false),
         alwaysShowCardActions = prefs.getBoolean("always_show_card_actions", false),
         checkAbbDaily = prefs.getBoolean("check_abb_daily", true),
         hideCoverArt = prefs.getBoolean("hide_cover_art", false),
         themeModeCode = prefs.getString("theme_mode", "SYSTEM") ?: "SYSTEM",
-        notifyHour = prefs.getInt("notify_hour", 9),
-        notifyMinute = prefs.getInt("notify_minute", 0),
+        notifyHour = prefs.getInt("notify_hour", 9).coerceIn(0, 23),
+        notifyMinute = prefs.getInt("notify_minute", 0).coerceIn(0, 59),
         marketplaceCode = prefs.getString("marketplace_code", "US") ?: "US"
     )
 
+    fun getPrefs(): FilterPrefs = readPrefs().also { _prefsFlow.value = it }
+
     fun savePrefs(newPrefs: FilterPrefs) {
+        val sanitized = newPrefs.copy(
+            notifyHour = newPrefs.notifyHour.coerceIn(0, 23),
+            notifyMinute = newPrefs.notifyMinute.coerceIn(0, 59)
+        )
         prefs.edit()
-            .putBoolean("english_only", newPrefs.englishOnly)
-            .putBoolean("hide_abridged", newPrefs.hideAbridged)
-            .putBoolean("hide_dramatized", newPrefs.hideDramatized)
-            .putBoolean("enable_direct_add", newPrefs.enableDirectAdd)
-            .putBoolean("always_show_card_actions", newPrefs.alwaysShowCardActions)
-            .putBoolean("check_abb_daily", newPrefs.checkAbbDaily)
-            .putBoolean("hide_cover_art", newPrefs.hideCoverArt)
-            .putString("theme_mode", newPrefs.themeModeCode)
-            .putInt("notify_hour", newPrefs.notifyHour)
-            .putInt("notify_minute", newPrefs.notifyMinute)
-            .putString("marketplace_code", newPrefs.marketplaceCode)
+            .putBoolean("english_only", sanitized.englishOnly)
+            .putBoolean("hide_abridged", sanitized.hideAbridged)
+            .putBoolean("hide_dramatized", sanitized.hideDramatized)
+            .putBoolean("always_show_card_actions", sanitized.alwaysShowCardActions)
+            .putBoolean("check_abb_daily", sanitized.checkAbbDaily)
+            .putBoolean("hide_cover_art", sanitized.hideCoverArt)
+            .putString("theme_mode", sanitized.themeModeCode)
+            .putInt("notify_hour", sanitized.notifyHour)
+            .putInt("notify_minute", sanitized.notifyMinute)
+            .putString("marketplace_code", sanitized.marketplaceCode)
             .apply()
+        AudibleApiClient.activeMarketplace = sanitized.marketplace
+        _prefsFlow.value = sanitized
     }
 
-    fun getSyncTelemetry(): SyncTelemetry = SyncTelemetry(
+    private fun readSyncTelemetry(): SyncTelemetry = SyncTelemetry(
         lastSyncEpochMs = prefs.getLong("last_sync_epoch_ms", 0L),
         lastSyncSourcesCount = prefs.getInt("last_sync_sources_count", 0),
         lastSyncErrorCount = prefs.getInt("last_sync_error_count", 0),
         lastSyncUsedCachedFallback = prefs.getBoolean("last_sync_used_cached_fallback", false)
     )
 
+    fun getSyncTelemetry(): SyncTelemetry = readSyncTelemetry().also { _telemetryFlow.value = it }
+
     private fun saveSyncTelemetry(sourcesCount: Int, errorCount: Int, usedCachedFallback: Boolean) {
+        val now = System.currentTimeMillis()
         prefs.edit()
-            .putLong("last_sync_epoch_ms", System.currentTimeMillis())
+            .putLong("last_sync_epoch_ms", now)
             .putInt("last_sync_sources_count", sourcesCount)
             .putInt("last_sync_error_count", errorCount)
             .putBoolean("last_sync_used_cached_fallback", usedCachedFallback)
             .apply()
+        _telemetryFlow.value = SyncTelemetry(
+            lastSyncEpochMs = now,
+            lastSyncSourcesCount = sourcesCount,
+            lastSyncErrorCount = errorCount,
+            lastSyncUsedCachedFallback = usedCachedFallback
+        )
     }
 
     suspend fun addTrackedItemUnique(
@@ -234,16 +312,6 @@ class ReleaseRepository(context: Context) {
             .replace(Regex("\\bbook\\s+ii\\b"), "book 2")
             .replace(Regex("\\bbook\\s+i\\b"), "book 1")
             .replace(Regex("[^a-z0-9]"), "")
-    }
-
-    private fun matchesPersonNameExactOrWordBoundary(candidateName: String, targetQuery: String): Boolean {
-        val cand = candidateName.trim()
-        val target = targetQuery.trim()
-        if (cand.isBlank() || target.isBlank()) return false
-        if (cand.equals(target, ignoreCase = true)) return true
-        if (AudibleApiClient.isExactAuthorNameMatch(cand, target)) return true
-        val escaped = Regex.escape(target)
-        return Regex("\\b$escaped\\b", RegexOption.IGNORE_CASE).containsMatchIn(cand)
     }
 
     private fun mergeDuplicateEditions(existing: CatalogProduct, candidate: CatalogProduct): CatalogProduct {
@@ -356,7 +424,18 @@ class ReleaseRepository(context: Context) {
         return dao.getAllReleases()
     }
 
-    suspend fun syncCatalog(forceRefresh: Boolean = false): List<ReleaseEntity> {
+    suspend fun syncCatalog(forceRefresh: Boolean = false): List<ReleaseEntity> = syncMutex.withLock {
+        _isSyncing.value = true
+        try {
+            syncCatalogInternal(forceRefresh)
+        } finally {
+            _isSyncing.value = false
+        }
+    }
+
+    private suspend fun syncCatalogInternal(forceRefresh: Boolean): List<ReleaseEntity> {
+        val filterPrefs = getPrefs()
+        AudibleApiClient.activeMarketplace = filterPrefs.marketplace
         AudibleApiClient.pruneStaleDiskCache()
         AudibleApiClient.syncNetworkErrorCount.set(0)
         AudibleApiClient.syncUsedStaleCacheCount.set(0)
@@ -382,7 +461,6 @@ class ReleaseRepository(context: Context) {
             "${normT}_${normA}"
         }
 
-        val filterPrefs = getPrefs()
         val todayIso = LocalDate.now().toString()
         val recentCutoffIso = LocalDate.now().minusDays(30).toString()
 

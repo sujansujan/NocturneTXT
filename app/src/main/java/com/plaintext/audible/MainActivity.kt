@@ -7,6 +7,7 @@ import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -25,7 +26,7 @@ class MainActivity : ComponentActivity() {
 
     private lateinit var repo: ReleaseRepository
     private var sharedImportPayload by mutableStateOf<String?>(null)
-    private var externalStatusBanner by mutableStateOf<String?>(null)
+    private var externalStatusBanner by mutableStateOf<Pair<String, Boolean>?>(null)
 
     private val requestNotifPermission = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -36,11 +37,19 @@ class MainActivity : ComponentActivity() {
     ) { uri ->
         if (uri != null) {
             lifecycleScope.launch {
-                val json = withContext(Dispatchers.IO) { BackupManager.exportJson(repo) }
-                contentResolver.openOutputStream(uri)?.use { out ->
-                    out.write(json.toByteArray(Charsets.UTF_8))
+                val result = runCatching {
+                    withContext(Dispatchers.IO) {
+                        val json = BackupManager.exportJson(repo)
+                        contentResolver.openOutputStream(uri)?.use { out ->
+                            out.write(json.toByteArray(Charsets.UTF_8))
+                        } ?: error("Unable to open destination file")
+                    }
                 }
-                externalStatusBanner = "OK: BACKUP EXPORTED (.JSON)"
+                externalStatusBanner = if (result.isSuccess) {
+                    "OK: BACKUP EXPORTED (.JSON)" to false
+                } else {
+                    "WARN: BACKUP EXPORT FAILED" to true
+                }
             }
         }
     }
@@ -50,21 +59,32 @@ class MainActivity : ComponentActivity() {
     ) { uri ->
         if (uri != null) {
             lifecycleScope.launch {
-                val raw = withContext(Dispatchers.IO) {
-                    contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() }
-                }
-                if (!raw.isNullOrBlank()) {
+                val result = runCatching {
                     withContext(Dispatchers.IO) {
+                        val raw = contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() }
+                            ?: error("Unable to read backup file")
+                        require(raw.isNotBlank()) { "Backup file is empty" }
                         BackupManager.importJson(repo, raw)
+                        val importedPrefs = repo.getPrefs()
+                        ReleaseCheckWorker.scheduleDailyCheck(
+                            this@MainActivity,
+                            importedPrefs.notifyHour,
+                            importedPrefs.notifyMinute
+                        )
                         repo.syncCatalog(forceRefresh = false)
                     }
-                    externalStatusBanner = "OK: BACKUP RESTORED (.JSON)"
+                }
+                externalStatusBanner = if (result.isSuccess) {
+                    "OK: BACKUP RESTORED (.JSON)" to false
+                } else {
+                    "WARN: INVALID OR UNREADABLE BACKUP FILE" to true
                 }
             }
         }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        enableEdgeToEdge()
         super.onCreate(savedInstanceState)
         repo = ReleaseRepository(applicationContext)
 
@@ -88,7 +108,8 @@ class MainActivity : ComponentActivity() {
                 repo = repo,
                 sharedImportText = sharedImportPayload,
                 onConsumeSharedImport = { sharedImportPayload = null },
-                externalStatusMessage = externalStatusBanner,
+                externalStatusMessage = externalStatusBanner?.first,
+                externalStatusIsWarn = externalStatusBanner?.second ?: false,
                 onConsumeExternalStatus = { externalStatusBanner = null },
                 onExportBackup = { exportLauncher.launch("nocturnetxt-backup.json") },
                 onImportBackup = { importLauncher.launch(arrayOf("application/json", "*/*")) }

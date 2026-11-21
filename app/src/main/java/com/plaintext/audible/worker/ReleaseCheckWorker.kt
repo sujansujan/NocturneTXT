@@ -34,8 +34,9 @@ class ReleaseCheckWorker(
             val relDate = runCatching { LocalDate.parse(rel.releaseDateIso) }.getOrNull() ?: continue
             val daysUntil = ChronoUnit.DAYS.between(today, relDate)
 
-            if (daysUntil == 7L && !rel.notifiedSevenDay) {
-                sendReleaseNotification(rel, domain, tag = "[T-7 DAYS]", targetUrl = null)
+            if (daysUntil in 1L..7L && !rel.notifiedSevenDay) {
+                val tag = if (daysUntil == 1L) "[T-1 DAY]" else "[T-${daysUntil} DAYS]"
+                sendReleaseNotification(rel, domain, tag = tag, targetUrl = null)
                 repo.dao.updateNotificationFlags(rel.asin, sevenDay = true, releaseDay = rel.notifiedReleaseDay)
             } else if (daysUntil == 0L && !rel.notifiedReleaseDay) {
                 sendReleaseNotification(rel, domain, tag = "[OUT TODAY]", targetUrl = null)
@@ -78,7 +79,7 @@ class ReleaseCheckWorker(
 
         val title = "$tag ${rel.title}"
         val seriesPart = if (rel.seriesTitle.isNotBlank()) " (${rel.seriesTitle})" else ""
-        val body = "By ${rel.authors} • Narrated by ${rel.narrators}$seriesPart"
+        val body = "By ${rel.authors} | Narrated by ${rel.narrators}$seriesPart"
 
         val url = targetUrl ?: run {
             val query = URLEncoder.encode("${rel.title} ${rel.authors.split(",").firstOrNull().orEmpty()}", "UTF-8")

@@ -13,7 +13,6 @@ object BackupManager {
             put("englishOnly", prefs.englishOnly)
             put("hideAbridged", prefs.hideAbridged)
             put("hideDramatized", prefs.hideDramatized)
-            put("enableDirectAdd", prefs.enableDirectAdd)
             put("alwaysShowCardActions", prefs.alwaysShowCardActions)
             put("checkAbbDaily", prefs.checkAbbDaily)
             put("hideCoverArt", prefs.hideCoverArt)
@@ -63,13 +62,12 @@ object BackupManager {
                     englishOnly = p.optBoolean("englishOnly", true),
                     hideAbridged = p.optBoolean("hideAbridged", true),
                     hideDramatized = p.optBoolean("hideDramatized", false),
-                    enableDirectAdd = p.optBoolean("enableDirectAdd", false),
                     alwaysShowCardActions = p.optBoolean("alwaysShowCardActions", false),
                     checkAbbDaily = p.optBoolean("checkAbbDaily", true),
                     hideCoverArt = p.optBoolean("hideCoverArt", false),
                     themeModeCode = themeCode,
-                    notifyHour = p.optInt("notifyHour", 9),
-                    notifyMinute = p.optInt("notifyMinute", 0),
+                    notifyHour = p.optInt("notifyHour", 9).coerceIn(0, 23),
+                    notifyMinute = p.optInt("notifyMinute", 0).coerceIn(0, 59),
                     marketplaceCode = p.optString("marketplaceCode", "US")
                 )
             )
@@ -78,10 +76,13 @@ object BackupManager {
         root.optJSONArray("trackedItems")?.let { arr ->
             for (i in 0 until arr.length()) {
                 val o = arr.optJSONObject(i) ?: continue
+                val type = runCatching { TrackType.valueOf(o.optString("type")) }.getOrNull() ?: continue
+                val query = o.optString("queryValue", "").trim()
+                if (query.isBlank()) continue
                 repo.addTrackedItemUnique(
-                    type = TrackType.valueOf(o.getString("type")),
-                    rawQuery = o.getString("queryValue"),
-                    lastReadSequence = o.optInt("lastReadSequence", 0),
+                    type = type,
+                    rawQuery = query,
+                    lastReadSequence = o.optInt("lastReadSequence", 0).coerceAtLeast(0),
                     initialThumbnailUrl = o.optString("thumbnailUrl", ""),
                     externalId = o.optString("externalId", "").ifBlank { null }
                 )
@@ -91,11 +92,14 @@ object BackupManager {
         root.optJSONArray("dndRules")?.let { arr ->
             for (i in 0 until arr.length()) {
                 val o = arr.optJSONObject(i) ?: continue
+                val targetType = runCatching { DndTargetType.valueOf(o.optString("targetType")) }.getOrNull() ?: continue
+                val targetKey = o.optString("targetKey", "").trim()
+                if (targetKey.isBlank()) continue
                 repo.dao.insertDndRule(
                     DndRuleEntity(
-                        targetKey = o.getString("targetKey"),
-                        targetType = DndTargetType.valueOf(o.getString("targetType")),
-                        displayTitle = o.getString("displayTitle")
+                        targetKey = targetKey,
+                        targetType = targetType,
+                        displayTitle = o.optString("displayTitle", targetKey)
                     )
                 )
             }
