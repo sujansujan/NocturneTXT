@@ -75,5 +75,33 @@ data class ReleaseEntity(
     val abbAvailable: Boolean = false,
     val abbPostUrl: String = "",
     val abbMagnetUri: String = "",
-    val notifiedAbbAvailable: Boolean = false
+    val notifiedAbbAvailable: Boolean = false,
+    val notifiedDateShift: Boolean = false,
+    val notifiedNarratorAnnounced: Boolean = false
+)
+
+@Immutable
+@Entity(tableName = "read_books")
+data class ReadBookEntity(
+    @PrimaryKey val asin: String,
+    val groupKey: String = "",
+    val title: String,
+    val authors: String,
+    val narrators: String = "",
+    val seriesTitle: String = "",
+    val seriesAsin: String = "",
+    val seriesSequence: Int? = null,
+    val runtimeMinutes: Int = 0,
+    val coverUrl: String = "",
+    val releaseDateIso: String = "",
+    val readAtEpochMs: Long = System.currentTimeMillis()
+)
+
+@Immutable
+@Entity(tableName = "pinned_releases")
+data class PinnedReleaseEntity(
+    @PrimaryKey val asin: String,
+    val groupKey: String = "",
+    val title: String,
+    val createdAt: Long = System.currentTimeMillis()
 )

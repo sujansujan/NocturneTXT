@@ -22,6 +22,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -38,8 +39,15 @@ import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.core.view.WindowCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
@@ -49,8 +57,10 @@ import com.plaintext.audible.worker.ReleaseCheckWorker
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.net.URLEncoder
+import java.time.Instant
 import java.time.LocalDate
 import java.time.YearMonth
+import java.time.ZoneId
 import java.time.ZoneOffset
 import java.time.format.DateTimeFormatter
 import java.time.temporal.ChronoUnit
@@ -62,12 +72,14 @@ enum class ActiveTab {
 
 enum class QuickFilter(val label: String) {
     ALL("ALL"),
+    PINNED("PIN"),
     SERIES("SERIES"),
     AUTHOR("AUTHOR"),
     NARRATOR("NARRATOR"),
     SOON_30D("<=30d"),
     RECENT_30D("RECENT"),
     ABB("ABB"),
+    READ("READ"),
     DND("DND")
 }
 
@@ -91,6 +103,9 @@ data class ReleaseCardUiModel(
     val headerLabel: String,
     val urgencyTone: Int, // 0 = green (OUT TODAY/ABB), 1 = orange (1..7d), 2 = cyan (8..30d), 3 = comment (>30d/TBA/past)
     val isFutureOrTba: Boolean,
+    val isPastOrToday: Boolean,
+    val isPinned: Boolean,
+    val hasDateShift: Boolean,
     val seriesValue: String,
     val sameAuthorAndNarrator: Boolean,
     val runtimeFormatted: String,
@@ -133,6 +148,7 @@ fun TrackerScreen(
     val prefs by repo.prefsFlow.collectAsState()
     val syncTelemetry by repo.telemetryFlow.collectAsState()
     val isSyncing by repo.isSyncing.collectAsState()
+    val isCheckingAbbBatch by repo.isCheckingAbb.collectAsState()
     val syncProgress by repo.syncProgress.collectAsState()
 
     val systemDark = isSystemInDarkTheme()
@@ -155,6 +171,13 @@ fun TrackerScreen(
     val releases by repo.dao.observeReleases().collectAsState(initial = emptyList())
     val trackedItems by repo.dao.observeTrackedItems().collectAsState(initial = emptyList())
     val dndRules by repo.dao.observeDndRules().collectAsState(initial = emptyList())
+    val readBooks by repo.dao.observeReadBooks().collectAsState(initial = emptyList())
+    val pinnedReleases by repo.dao.observePinnedReleases().collectAsState(initial = emptyList())
+
+    val readAsins = remember(readBooks) { readBooks.map { it.asin.lowercase(Locale.US) }.toSet() }
+    val readGroupKeys = remember(readBooks) { readBooks.mapNotNull { it.groupKey.takeIf { gk -> gk.isNotBlank() } }.toSet() }
+    val pinnedAsins = remember(pinnedReleases) { pinnedReleases.map { it.asin.lowercase(Locale.US) }.toSet() }
+    val pinnedGroupKeys = remember(pinnedReleases) { pinnedReleases.mapNotNull { it.groupKey.takeIf { gk -> gk.isNotBlank() } }.toSet() }
 
     var activeTab by remember { mutableStateOf(ActiveTab.UPCOMING) }
     var lastNonHomeTab by remember { mutableStateOf<ActiveTab?>(null) }
@@ -162,9 +185,12 @@ fun TrackerScreen(
     var trackedSourceFilter by remember { mutableStateOf(TrackedSourceFilter.ALL) }
     var trackedSortOrder by remember { mutableStateOf(TrackedSortOrder.A_TO_Z) }
     var focusedSourceItem by remember { mutableStateOf<TrackedItemEntity?>(null) }
+    var localFilterOpen by remember { mutableStateOf(false) }
+    var localFilterQuery by remember { mutableStateOf("") }
     var showTbaExpanded by remember { mutableStateOf(false) }
     var showAboutPage by remember { mutableStateOf(false) }
     var recentlyDeletedItem by remember { mutableStateOf<TrackedItemEntity?>(null) }
+    var recentlyMarkedRead by remember { mutableStateOf<MarkReadOutcome?>(null) }
     var checkingAbbAsins by remember { mutableStateOf<Set<String>>(emptySet()) }
 
     val upcomingListState = rememberLazyListState()
@@ -247,6 +273,13 @@ fun TrackerScreen(
         }
     }
 
+    LaunchedEffect(recentlyMarkedRead) {
+        if (recentlyMarkedRead != null) {
+            delay(5000L)
+            recentlyMarkedRead = null
+        }
+    }
+
     val navigateToTab: (ActiveTab) -> Unit = { targetTab ->
         if (targetTab != activeTab) {
             if (targetTab == ActiveTab.UPCOMING) {
@@ -257,6 +290,8 @@ fun TrackerScreen(
             if (targetTab != ActiveTab.SETTINGS) {
                 showAboutPage = false
             }
+            localFilterOpen = false
+            localFilterQuery = ""
             activeTab = targetTab
         } else if (targetTab == ActiveTab.SETTINGS && showAboutPage) {
             showAboutPage = false
@@ -271,6 +306,8 @@ fun TrackerScreen(
     }
 
     val shouldInterceptBack = activeSharedQuery != null ||
+        localFilterOpen ||
+        localFilterQuery.isNotBlank() ||
         showAboutPage ||
         focusedSourceItem != null ||
         activeTab != ActiveTab.UPCOMING ||
@@ -282,6 +319,10 @@ fun TrackerScreen(
                 activeSharedQuery = null
                 sharedResolution = null
                 isResolvingShared = false
+            }
+            localFilterOpen || localFilterQuery.isNotBlank() -> {
+                localFilterOpen = false
+                localFilterQuery = ""
             }
             showAboutPage -> {
                 showAboutPage = false
@@ -357,11 +398,32 @@ fun TrackerScreen(
         }
     }
 
-    val upcomingCount = remember(releases, todayIso) {
-        releases.count { it.releaseDateIso != "TBA" && it.releaseDateIso >= todayIso }
+    val unreadReleases = remember(releases, readAsins, readGroupKeys) {
+        releases.filterNot { ReleaseRepository.isReleaseRead(it, readAsins, readGroupKeys) }
     }
-    val abbAvailableCount = remember(releases) {
-        releases.count { it.abbAvailable }
+    val upcomingCount = remember(unreadReleases, todayIso) {
+        unreadReleases.count { it.releaseDateIso != "TBA" && it.releaseDateIso >= todayIso }
+    }
+    val abbAvailableCount = remember(unreadReleases) {
+        unreadReleases.count { it.abbAvailable }
+    }
+    val pinnedActiveCount = remember(unreadReleases, pinnedAsins, pinnedGroupKeys) {
+        unreadReleases.count { ReleaseRepository.isReleasePinned(it, pinnedAsins, pinnedGroupKeys) }
+    }
+
+    val handleRunManualAbbCheck: () -> Unit = remember(repo) {
+        {
+            if (!repo.isCheckingAbb.value) {
+                scope.launch {
+                    postAsciiStatus("CHECKING AUDIOBOOKBAY...", false)
+                    val newlyFound = repo.runManualAbbCheck()
+                    postAsciiStatus(
+                        if (newlyFound > 0) "ABB CHECK: +$newlyFound NEWLY VERIFIED" else "ABB CHECK COMPLETE (0 NEW)",
+                        false
+                    )
+                }
+            }
+        }
     }
 
     val trackedKeySet = remember(trackedItems) {
@@ -397,36 +459,74 @@ fun TrackerScreen(
                         bold = true
                     )
                     if (activeTab != ActiveTab.SETTINGS) {
-                        val syncLabel = if (isSyncing) {
-                            if (syncProgress.total > 0) {
-                                "$syncSpinner SYNC ${syncProgress.done}/${syncProgress.total}"
-                            } else {
-                                "$syncSpinner SYNCING"
-                            }
-                        } else {
-                            "SYNC"
-                        }
-                        BracketButton(
-                            label = syncLabel,
-                            color = palette.green,
-                            onClick = {
-                                if (!isSyncing) {
-                                    scope.launch {
-                                        repo.syncCatalog(forceRefresh = true)
-                                        val latestTelemetry = repo.telemetryFlow.value
-                                        postAsciiStatus(
-                                            "SYNC COMPLETE (${latestTelemetry.statusSummary})",
-                                            latestTelemetry.lastSyncErrorCount > 0
-                                        )
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            AsciiInvertButton(
+                                label = if (localFilterQuery.isNotBlank()) "/:${localFilterQuery.take(6)}" else "/",
+                                active = localFilterOpen || localFilterQuery.isNotBlank(),
+                                color = palette.cyan,
+                                onClick = {
+                                    if (localFilterOpen) {
+                                        localFilterOpen = false
+                                        localFilterQuery = ""
+                                    } else {
+                                        localFilterOpen = true
                                     }
                                 }
+                            )
+                            val syncLabel = if (isSyncing) {
+                                if (syncProgress.total > 0) {
+                                    "$syncSpinner SYNC ${syncProgress.done}/${syncProgress.total}"
+                                } else {
+                                    "$syncSpinner SYNCING"
+                                }
+                            } else {
+                                "SYNC"
                             }
-                        )
+                            BracketButton(
+                                label = syncLabel,
+                                color = palette.green,
+                                onClick = {
+                                    if (!isSyncing) {
+                                        scope.launch {
+                                            repo.syncCatalog(forceRefresh = true)
+                                            val latestTelemetry = repo.telemetryFlow.value
+                                            postAsciiStatus(
+                                                "SYNC COMPLETE (${latestTelemetry.statusSummary})",
+                                                latestTelemetry.lastSyncErrorCount > 0
+                                            )
+                                        }
+                                    }
+                                }
+                            )
+                        }
                     }
                 }
 
                 AsciiRule(pattern = "- ")
                 Spacer(modifier = Modifier.height(4.dp))
+
+                if (localFilterOpen && activeTab != ActiveTab.SETTINGS) {
+                    val focusManager = LocalFocusManager.current
+                    val keyboardController = LocalSoftwareKeyboardController.current
+                    AsciiTextField(
+                        value = localFilterQuery,
+                        onValueChange = { localFilterQuery = it },
+                        placeholder = if (activeTab == ActiveTab.UPCOMING) {
+                            "Filter title, series, author, narrator..."
+                        } else {
+                            "Filter followed sources..."
+                        },
+                        imeAction = ImeAction.Search,
+                        onImeAction = {
+                            focusManager.clearFocus()
+                            keyboardController?.hide()
+                        }
+                    )
+                    Spacer(modifier = Modifier.height(6.dp))
+                }
 
                 if (activeSharedQuery != null) {
                     SharedImportAsciiPanel(
@@ -460,14 +560,23 @@ fun TrackerScreen(
                             releases = releases,
                             trackedItems = trackedItems,
                             dndRules = dndRules,
+                            readBooks = readBooks,
+                            readAsins = readAsins,
+                            readGroupKeys = readGroupKeys,
+                            pinnedAsins = pinnedAsins,
+                            pinnedGroupKeys = pinnedGroupKeys,
                             quickFilter = activeFilter,
+                            localFilterQuery = localFilterQuery,
                             focusedSourceItem = focusedSourceItem,
+                            recentlyMarkedRead = recentlyMarkedRead,
                             onClearFocusedSource = { focusedSourceItem = null },
                             alwaysShowCardActions = prefs.alwaysShowCardActions,
                             hideCoverArt = prefs.hideCoverArt,
                             showTbaExpanded = showTbaExpanded,
                             checkingAbbAsins = checkingAbbAsins,
+                            isCheckingAbbBatch = isCheckingAbbBatch,
                             onToggleTba = { showTbaExpanded = !showTbaExpanded },
+                            onRunManualAbbCheck = handleRunManualAbbCheck,
                             onClearNewBadges = {
                                 scope.launch {
                                     repo.dao.clearNewDiscoveryFlags()
@@ -586,6 +695,35 @@ fun TrackerScreen(
                                         }
                                     }
                                 }
+                            },
+                            onMarkRead = { cardItem ->
+                                scope.launch {
+                                    val outcome = repo.markReleaseRead(cardItem.entity)
+                                    recentlyMarkedRead = outcome
+                                    postAsciiStatus("MARKED READ: ${cardItem.upperTitle}", false)
+                                }
+                            },
+                            onUndoMarkRead = { outcome ->
+                                scope.launch {
+                                    recentlyMarkedRead = null
+                                    repo.undoMarkRead(outcome)
+                                    postAsciiStatus("UNDID READ: ${outcome.readBook.title.uppercase()}", false)
+                                }
+                            },
+                            onUnmarkReadBook = { readBook ->
+                                scope.launch {
+                                    repo.unmarkReadBook(readBook)
+                                    postAsciiStatus("UNMARKED READ: ${readBook.title.uppercase()}", false)
+                                }
+                            },
+                            onTogglePin = { cardItem ->
+                                scope.launch {
+                                    val nowPinned = repo.togglePinRelease(cardItem.entity)
+                                    postAsciiStatus(
+                                        if (nowPinned) "* PINNED: ${cardItem.upperTitle}" else "UNPINNED: ${cardItem.upperTitle}",
+                                        false
+                                    )
+                                }
                             }
                         )
 
@@ -594,6 +732,9 @@ fun TrackerScreen(
                             today = today,
                             trackedItems = trackedItems,
                             releases = releases,
+                            readAsins = readAsins,
+                            readGroupKeys = readGroupKeys,
+                            localFilterQuery = localFilterQuery,
                             sourceFilter = trackedSourceFilter,
                             sortOrder = trackedSortOrder,
                             hideCoverArt = prefs.hideCoverArt,
@@ -603,7 +744,24 @@ fun TrackerScreen(
                                 focusedSourceItem = item
                                 activeFilter = QuickFilter.ALL
                                 lastNonHomeTab = ActiveTab.TRACKED
+                                localFilterOpen = false
+                                localFilterQuery = ""
                                 activeTab = ActiveTab.UPCOMING
+                            },
+                            onEditTracked = { item, newQuery, refreshMeta ->
+                                scope.launch {
+                                    val ok = repo.editTrackedItemAndRefresh(item, newQuery, refreshMeta)
+                                    if (ok) {
+                                        postAsciiStatus(
+                                            if (refreshMeta) "REFRESHING META: ${newQuery.trim().uppercase()}"
+                                            else "UPDATED ${item.type.name}: ${newQuery.trim().uppercase()}",
+                                            false
+                                        )
+                                        repo.syncCatalog(forceRefresh = refreshMeta)
+                                    } else {
+                                        postAsciiStatus("WARN: INVALID OR DUPLICATE NAME", true)
+                                    }
+                                }
                             },
                             onDeleteTracked = { item ->
                                 scope.launch {
@@ -642,7 +800,9 @@ fun TrackerScreen(
                                     prefs = prefs,
                                     syncTelemetry = syncTelemetry,
                                     isSyncing = isSyncing,
+                                    isCheckingAbbBatch = isCheckingAbbBatch,
                                     syncProgress = syncProgress,
+                                    onRunManualAbbCheck = handleRunManualAbbCheck,
                                     onUpdatePrefs = { updated ->
                                         val prev = repo.prefsFlow.value
                                         repo.savePrefs(updated)
@@ -685,7 +845,9 @@ fun TrackerScreen(
                 trackedSortOrder = trackedSortOrder,
                 upcomingCount = upcomingCount,
                 trackedCount = trackedItems.size,
+                pinnedCount = pinnedActiveCount,
                 abbCount = abbAvailableCount,
+                readCount = readBooks.size,
                 dndCount = dndRules.size,
                 statusTickerText = statusTickerText,
                 statusTickerIsWarn = statusTickerIsWarn,
@@ -881,7 +1043,9 @@ private fun BottomThumbBar(
     trackedSortOrder: TrackedSortOrder,
     upcomingCount: Int,
     trackedCount: Int,
+    pinnedCount: Int,
     abbCount: Int,
+    readCount: Int,
     dndCount: Int,
     statusTickerText: String?,
     statusTickerIsWarn: Boolean,
@@ -953,12 +1117,16 @@ private fun BottomThumbBar(
                     MonoText(text = "FLT:", color = palette.comment, fontSizeSp = 11)
                     QuickFilter.values().forEach { filter ->
                         val chipLabel = when (filter) {
+                            QuickFilter.PINNED -> "PIN:$pinnedCount"
                             QuickFilter.ABB -> "ABB:$abbCount"
+                            QuickFilter.READ -> "READ:$readCount"
                             QuickFilter.DND -> "DND:$dndCount"
                             else -> filter.label
                         }
                         val chipColor = when (filter) {
+                            QuickFilter.PINNED -> palette.yellow
                             QuickFilter.ABB -> palette.green
+                            QuickFilter.READ -> palette.cyan
                             QuickFilter.DND -> palette.red
                             QuickFilter.RECENT_30D -> palette.orange
                             else -> palette.purple
@@ -1063,14 +1231,23 @@ private fun UpcomingFeedView(
     releases: List<ReleaseEntity>,
     trackedItems: List<TrackedItemEntity>,
     dndRules: List<DndRuleEntity>,
+    readBooks: List<ReadBookEntity>,
+    readAsins: Set<String>,
+    readGroupKeys: Set<String>,
+    pinnedAsins: Set<String>,
+    pinnedGroupKeys: Set<String>,
     quickFilter: QuickFilter,
+    localFilterQuery: String,
     focusedSourceItem: TrackedItemEntity?,
+    recentlyMarkedRead: MarkReadOutcome?,
     onClearFocusedSource: () -> Unit,
     alwaysShowCardActions: Boolean,
     hideCoverArt: Boolean,
     showTbaExpanded: Boolean,
     checkingAbbAsins: Set<String>,
+    isCheckingAbbBatch: Boolean,
     onToggleTba: () -> Unit,
+    onRunManualAbbCheck: () -> Unit,
     onClearNewBadges: () -> Unit,
     onOpenAudibleSearch: (ReleaseCardUiModel) -> Unit,
     onOpenAudioBookBay: (ReleaseCardUiModel) -> Unit,
@@ -1083,12 +1260,27 @@ private fun UpcomingFeedView(
     onMuteSeries: (ReleaseCardUiModel) -> Unit,
     onUnmuteRule: (DndRuleEntity) -> Unit,
     onMarkSeriesSeqRead: (TrackedItemEntity, Int) -> Unit,
-    onAutoCheckAbb: (ReleaseCardUiModel) -> Unit = {}
+    onAutoCheckAbb: (ReleaseCardUiModel) -> Unit = {},
+    onMarkRead: (ReleaseCardUiModel) -> Unit = {},
+    onUndoMarkRead: (MarkReadOutcome) -> Unit = {},
+    onUnmarkReadBook: (ReadBookEntity) -> Unit = {},
+    onTogglePin: (ReleaseCardUiModel) -> Unit = {}
 ) {
     val palette = LocalPtsPalette.current
     val todayIso = remember(today) { today.toString() }
+    val monthFormatter = remember { DateTimeFormatter.ofPattern("MMMM yyyy", Locale.US) }
+    val dateFormatter = remember { DateTimeFormatter.ofPattern("yyyy-MM-dd", Locale.US) }
+    val localQ = localFilterQuery.trim()
+    val batchAbbSpinner = rememberAsciiSpinner(active = isCheckingAbbBatch)
 
     if (quickFilter == QuickFilter.DND) {
+        val visibleDnd = remember(dndRules, localQ) {
+            if (localQ.isBlank()) dndRules
+            else dndRules.filter {
+                it.displayTitle.contains(localQ, ignoreCase = true) ||
+                    it.targetKey.contains(localQ, ignoreCase = true)
+            }
+        }
         LazyColumn(
             verticalArrangement = Arrangement.spacedBy(8.dp),
             contentPadding = PaddingValues(bottom = 112.dp),
@@ -1096,19 +1288,22 @@ private fun UpcomingFeedView(
         ) {
             item(key = "dnd_info", contentType = "info") {
                 AsciiSectionHeader(
-                    title = "DO NOT DISTURB (${dndRules.size} MUTED)",
+                    title = "DO NOT DISTURB (${visibleDnd.size} MUTED)",
                     color = palette.red
                 )
             }
-            if (dndRules.isEmpty()) {
+            if (visibleDnd.isEmpty()) {
                 item(key = "dnd_empty", contentType = "empty") {
                     AsciiBox(headerLabel = "DND FILTER EMPTY") {
-                        MonoText(text = "No muted books or series.", color = palette.comment)
+                        MonoText(
+                            text = if (localQ.isNotBlank()) "No muted entries match '$localQ'." else "No muted books or series.",
+                            color = palette.comment
+                        )
                     }
                 }
             }
             items(
-                items = dndRules,
+                items = visibleDnd,
                 key = { "dnd_${it.targetKey}" },
                 contentType = { "dnd_card" }
             ) { rule ->
@@ -1140,12 +1335,145 @@ private fun UpcomingFeedView(
         return
     }
 
-    val monthFormatter = remember { DateTimeFormatter.ofPattern("MMMM yyyy", Locale.US) }
+    if (quickFilter == QuickFilter.READ) {
+        val visibleRead = remember(readBooks, localQ) {
+            if (localQ.isBlank()) readBooks
+            else readBooks.filter { b ->
+                b.title.contains(localQ, ignoreCase = true) ||
+                    b.authors.contains(localQ, ignoreCase = true) ||
+                    b.narrators.contains(localQ, ignoreCase = true) ||
+                    b.seriesTitle.contains(localQ, ignoreCase = true) ||
+                    b.asin.equals(localQ, ignoreCase = true)
+            }
+        }
+        val totalReadMins = remember(visibleRead) { visibleRead.sumOf { it.runtimeMinutes } }
+        val readGroups = remember(visibleRead) {
+            visibleRead.groupBy { b ->
+                runCatching {
+                    val d = Instant.ofEpochMilli(b.readAtEpochMs).atZone(ZoneId.systemDefault()).toLocalDate()
+                    YearMonth.from(d).format(monthFormatter).uppercase()
+                }.getOrDefault("COMPLETED")
+            }.map { (monthLabel, list) ->
+                val mins = list.sumOf { it.runtimeMinutes }
+                val dur = if (mins > 0) " | ${mins / 60}H ${mins % 60}M" else ""
+                "$monthLabel (${list.size})$dur" to list
+            }
+        }
+
+        LazyColumn(
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+            contentPadding = PaddingValues(bottom = 112.dp),
+            modifier = Modifier.fillMaxSize()
+        ) {
+            item(key = "read_summary", contentType = "info") {
+                val totalDur = if (totalReadMins > 0) " | ${totalReadMins / 60}H ${totalReadMins % 60}M" else ""
+                AsciiSectionHeader(
+                    title = "READ LOG (${visibleRead.size} BOOKS$totalDur)",
+                    color = palette.cyan
+                )
+            }
+            if (visibleRead.isEmpty()) {
+                item(key = "read_empty", contentType = "empty") {
+                    AsciiBox(headerLabel = "READ LOG EMPTY") {
+                        MonoText(
+                            text = if (localQ.isNotBlank()) {
+                                "No completed books match '$localQ'."
+                            } else {
+                                "No books marked read yet.\nTap [ Mark Read ] on any release card to log it here."
+                            },
+                            color = palette.comment,
+                            fontSizeSp = 12
+                        )
+                    }
+                }
+            }
+            readGroups.forEach { (groupHeader, books) ->
+                stickyHeader(key = "read_hdr_$groupHeader") {
+                    AsciiSectionHeader(title = groupHeader, color = palette.purple)
+                }
+                items(
+                    items = books,
+                    key = { "read_${it.asin}" },
+                    contentType = { "read_card" }
+                ) { book ->
+                    val completedDateStr = remember(book.readAtEpochMs) {
+                        runCatching {
+                            Instant.ofEpochMilli(book.readAtEpochMs)
+                                .atZone(ZoneId.systemDefault())
+                                .toLocalDate()
+                                .format(dateFormatter)
+                        }.getOrDefault("READ")
+                    }
+                    val runtimeStr = if (book.runtimeMinutes > 0) {
+                        "${book.runtimeMinutes / 60}h ${book.runtimeMinutes % 60}m"
+                    } else "TBA"
+                    val cleanedTitle = book.title.replace(marketingSubtitleRegex, "").trim().ifBlank { book.title }
+                    AsciiBox(
+                        headerLabel = "READ $completedDateStr | ${book.asin}",
+                        borderColor = palette.green.copy(alpha = 0.7f),
+                        headerColor = palette.green
+                    ) {
+                        Row(verticalAlignment = Alignment.Top) {
+                            if (!hideCoverArt) {
+                                CoverThumbnail(
+                                    coverUrl = book.coverUrl,
+                                    sizeDp = StandardThumbnailSize,
+                                    borderColor = palette.green
+                                )
+                                Spacer(modifier = Modifier.width(10.dp))
+                            }
+                            Column(modifier = Modifier.weight(1f)) {
+                                MonoText(
+                                    text = cleanedTitle.uppercase(),
+                                    color = palette.foreground,
+                                    fontSizeSp = 14,
+                                    bold = true
+                                )
+                                if (book.seriesTitle.isNotBlank()) {
+                                    val seqPart = book.seriesSequence?.let { " #$it" }.orEmpty()
+                                    AsciiFieldRow("SER", "${book.seriesTitle}$seqPart", palette.purple)
+                                }
+                                AsciiFieldRow("AUT", book.authors, palette.foreground)
+                                if (book.narrators.isNotBlank() && !book.narrators.equals(book.authors, ignoreCase = true)) {
+                                    AsciiFieldRow("NAR", book.narrators, palette.yellow)
+                                }
+                            }
+                        }
+                        Spacer(modifier = Modifier.height(4.dp))
+                        AsciiRule(pattern = "- ")
+                        Spacer(modifier = Modifier.height(2.dp))
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            MonoText(
+                                text = "Runtime: $runtimeStr",
+                                color = palette.comment,
+                                fontSizeSp = 11
+                            )
+                            BracketButton(
+                                label = "UNREAD",
+                                color = palette.orange,
+                                onClick = { onUnmarkReadBook(book) }
+                            )
+                        }
+                    }
+                }
+            }
+        }
+        return
+    }
 
     val (monthGroups, tbaCards, newCount) = remember(
         releases,
         trackedItems,
+        readAsins,
+        readGroupKeys,
+        pinnedAsins,
+        pinnedGroupKeys,
         quickFilter,
+        localQ,
         focusedSourceItem,
         todayIso
     ) {
@@ -1159,6 +1487,11 @@ private fun UpcomingFeedView(
             val daysUntil = parsedDate?.let { ChronoUnit.DAYS.between(today, it) }
 
             val isFutureOrTba = daysUntil == null || daysUntil >= 0L
+            val isPastOrToday = daysUntil != null && daysUntil <= 0L
+            val isPinned = ReleaseRepository.isReleasePinned(rel, pinnedAsins, pinnedGroupKeys)
+            val hasDateShift = rel.previousReleaseDateIso.isNotBlank() &&
+                rel.previousReleaseDateIso != rel.releaseDateIso
+
             // Pure 7-bit ASCII header with no nested double brackets, plus 6-cell countdown bar for <=30d
             val countdownPart = when {
                 daysUntil == null -> "TBA"
@@ -1167,11 +1500,14 @@ private fun UpcomingFeedView(
                 daysUntil in 1L..30L -> "${asciiCountdownBar(daysUntil)} T-${daysUntil}d"
                 else -> "T-${daysUntil}d"
             }
-            val statusSuffix = when {
-                rel.abbAvailable -> " | ABB"
-                rel.isNewDiscovery && isFutureOrTba -> " | NEW"
-                else -> ""
+            val statusSuffix = buildString {
+                if (rel.abbAvailable) append(" | ABB")
+                if (hasDateShift && isFutureOrTba) append(" | MOVED")
+                if (rel.narratorJustAnnounced && isFutureOrTba) append(" | NAR!")
+                if (isEmpty() && rel.isNewDiscovery && isFutureOrTba) append(" | NEW")
             }
+            val pinPrefix = if (isPinned) "* " else ""
+
             // Urgency-tiered color codes:
             // 0 = green (OUT TODAY / ABB), 1 = orange (1..7d), 2 = cyan (8..30d), 3 = comment (>30d / TBA / past)
             val urgencyTone = when {
@@ -1222,9 +1558,12 @@ private fun UpcomingFeedView(
             return ReleaseCardUiModel(
                 entity = rel,
                 upperTitle = cleanedTitle.uppercase(),
-                headerLabel = "${rel.releaseDateIso} | $countdownPart$statusSuffix",
+                headerLabel = "$pinPrefix${rel.releaseDateIso} | $countdownPart$statusSuffix",
                 urgencyTone = urgencyTone,
                 isFutureOrTba = isFutureOrTba,
+                isPastOrToday = isPastOrToday,
+                isPinned = isPinned,
+                hasDateShift = hasDateShift,
                 seriesValue = if (rel.seriesTitle.isNotBlank()) {
                     "${rel.seriesTitle}${seq?.let { " #$it" }.orEmpty()}"
                 } else "",
@@ -1245,15 +1584,26 @@ private fun UpcomingFeedView(
             )
         }
 
-        val filtered = releases.filter { rel ->
+        val unread = releases.filterNot { ReleaseRepository.isReleaseRead(it, readAsins, readGroupKeys) }
+
+        val filtered = unread.filter { rel ->
             if (focusedSourceItem != null) {
                 if (!ReleaseRepository.releaseMatchesTrackedItem(rel, focusedSourceItem)) {
                     return@filter false
                 }
             }
+            if (localQ.isNotBlank()) {
+                val matchesLocal = rel.title.contains(localQ, ignoreCase = true) ||
+                    rel.authors.contains(localQ, ignoreCase = true) ||
+                    rel.narrators.contains(localQ, ignoreCase = true) ||
+                    rel.seriesTitle.contains(localQ, ignoreCase = true) ||
+                    rel.asin.equals(localQ, ignoreCase = true)
+                if (!matchesLocal) return@filter false
+            }
 
             val isPastRelease = rel.releaseDateIso != "TBA" && rel.releaseDateIso < todayIso
             when (quickFilter) {
+                QuickFilter.PINNED -> ReleaseRepository.isReleasePinned(rel, pinnedAsins, pinnedGroupKeys)
                 QuickFilter.RECENT_30D -> isPastRelease
                 QuickFilter.ABB -> rel.abbAvailable
                 QuickFilter.ALL -> !isPastRelease
@@ -1264,7 +1614,7 @@ private fun UpcomingFeedView(
                     val d = runCatching { ChronoUnit.DAYS.between(today, LocalDate.parse(rel.releaseDateIso)) }.getOrNull()
                     d != null && d in 0..30
                 }
-                QuickFilter.DND -> false
+                QuickFilter.READ, QuickFilter.DND -> false
             }
         }
 
@@ -1300,11 +1650,33 @@ private fun UpcomingFeedView(
             filtered.filter { it.releaseDateIso == "TBA" }.map(::toUiModel)
         }
 
-        val newlyDiscovered = releases.count { rel ->
+        val newlyDiscovered = unread.count { rel ->
             (rel.isNewDiscovery || rel.narratorJustAnnounced) &&
                 (rel.releaseDateIso == "TBA" || rel.releaseDateIso >= todayIso)
         }
         Triple(groups, tbas, newlyDiscovered)
+    }
+
+    val telemetryStripData = remember(releases, readBooks, readAsins, readGroupKeys, todayIso) {
+        val unreadUpcoming = releases.filter { rel ->
+            !ReleaseRepository.isReleaseRead(rel, readAsins, readGroupKeys) &&
+                rel.releaseDateIso != "TBA" &&
+                rel.releaseDateIso >= todayIso
+        }.sortedBy { it.releaseDateIso }
+        val nextDays = unreadUpcoming.firstOrNull()?.let { rel ->
+            runCatching { ChronoUnit.DAYS.between(today, LocalDate.parse(rel.releaseDateIso)) }.getOrNull()
+        }
+        val nextLabel = when {
+            nextDays == null -> "NONE"
+            nextDays <= 0L -> "TODAY"
+            else -> "T-${nextDays}d"
+        }
+        val soon30Count = unreadUpcoming.count { rel ->
+            val d = runCatching { ChronoUnit.DAYS.between(today, LocalDate.parse(rel.releaseDateIso)) }.getOrNull()
+            d != null && d in 0L..30L
+        }
+        val readHours = readBooks.sumOf { it.runtimeMinutes } / 60
+        listOf(nextLabel, "${unreadUpcoming.size}", "$soon30Count", "${readBooks.size}", "${readHours}H")
     }
 
     LazyColumn(
@@ -1313,6 +1685,94 @@ private fun UpcomingFeedView(
         contentPadding = PaddingValues(bottom = 112.dp),
         modifier = Modifier.fillMaxSize()
     ) {
+        if (focusedSourceItem == null && localQ.isBlank() && quickFilter != QuickFilter.RECENT_30D && quickFilter != QuickFilter.ABB) {
+            item(key = "stats_strip", contentType = "stats_strip") {
+                val nextTxt = telemetryStripData[0]
+                val upTxt = telemetryStripData[1]
+                val soonTxt = telemetryStripData[2]
+                val readTxt = telemetryStripData[3]
+                val hrsTxt = telemetryStripData[4]
+                val stripText = buildAnnotatedString {
+                    withStyle(SpanStyle(color = palette.comment)) { append("NEXT: ") }
+                    withStyle(SpanStyle(color = if (nextTxt == "TODAY") palette.green else palette.orange, fontWeight = FontWeight.Bold)) { append(nextTxt) }
+                    withStyle(SpanStyle(color = palette.comment)) { append(" | UP: ") }
+                    withStyle(SpanStyle(color = palette.cyan, fontWeight = FontWeight.Bold)) { append(upTxt) }
+                    withStyle(SpanStyle(color = palette.comment)) { append(" | <=30d: ") }
+                    withStyle(SpanStyle(color = palette.purple, fontWeight = FontWeight.Bold)) { append(soonTxt) }
+                    withStyle(SpanStyle(color = palette.comment)) { append(" | READ: ") }
+                    withStyle(SpanStyle(color = palette.green, fontWeight = FontWeight.Bold)) { append("$readTxt($hrsTxt)") }
+                }
+                Text(
+                    text = stripText,
+                    fontFamily = FontFamily.Monospace,
+                    fontSize = 11.sp,
+                    maxLines = 1,
+                    style = TextStyle(fontFeatureSettings = "liga 0, calt 0"),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(palette.surfaceLine.copy(alpha = 0.25f))
+                        .padding(horizontal = 8.dp, vertical = 5.dp)
+                )
+            }
+        }
+
+        if (recentlyMarkedRead != null) {
+            item(key = "undo_read_banner", contentType = "banner") {
+                AsciiBox(
+                    headerLabel = "MARKED AS READ",
+                    borderColor = palette.green,
+                    headerColor = palette.green
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        MonoText(
+                            text = recentlyMarkedRead.readBook.title.uppercase(),
+                            color = palette.green,
+                            fontSizeSp = 12,
+                            bold = true,
+                            modifier = Modifier.weight(1f)
+                        )
+                        BracketButton(
+                            label = "UNDO",
+                            color = palette.orange,
+                            onClick = { onUndoMarkRead(recentlyMarkedRead) }
+                        )
+                    }
+                }
+            }
+        }
+
+        if (quickFilter == QuickFilter.ABB) {
+            item(key = "abb_action_bar", contentType = "banner") {
+                AsciiBox(
+                    headerLabel = "AUDIOBOOKBAY VERIFICATION",
+                    borderColor = palette.green,
+                    headerColor = palette.green
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        MonoText(
+                            text = if (isCheckingAbbBatch) "Checking recent unread drops..." else "Check recent unread releases on ABB",
+                            color = palette.comment,
+                            fontSizeSp = 11,
+                            modifier = Modifier.weight(1f)
+                        )
+                        BracketButton(
+                            label = if (isCheckingAbbBatch) "$batchAbbSpinner CHECKING" else "CHECK ABB NOW",
+                            color = palette.green,
+                            onClick = onRunManualAbbCheck
+                        )
+                    }
+                }
+            }
+        }
+
         if (focusedSourceItem != null) {
             item(key = "focused_source_banner", contentType = "banner") {
                 AsciiBox(
@@ -1342,7 +1802,7 @@ private fun UpcomingFeedView(
             }
         }
 
-        if (newCount > 0 && quickFilter != QuickFilter.RECENT_30D && focusedSourceItem == null) {
+        if (newCount > 0 && quickFilter != QuickFilter.RECENT_30D && focusedSourceItem == null && localQ.isBlank()) {
             item(key = "new_discovery_banner", contentType = "banner") {
                 AsciiBox(
                     headerLabel = "NEW PRE-ORDER DISCOVERED",
@@ -1374,12 +1834,16 @@ private fun UpcomingFeedView(
             item(key = "empty_scoreboard", contentType = "empty") {
                 AsciiBox(headerLabel = "SCOREBOARD EMPTY") {
                     MonoText(
-                        text = if (focusedSourceItem != null) {
+                        text = if (localQ.isNotBlank()) {
+                            "No releases match filter '$localQ'."
+                        } else if (focusedSourceItem != null) {
                             "No scheduled upcoming releases found for '${focusedSourceItem.queryValue}'."
+                        } else if (quickFilter == QuickFilter.PINNED) {
+                            "No pinned releases yet. Expand any card and tap [ * Pin ] to star priority drops."
                         } else if (quickFilter == QuickFilter.RECENT_30D) {
-                            "No releases from the past 30 days found for your followed sources."
+                            "No unread releases from the past 30 days found for your followed sources."
                         } else if (quickFilter == QuickFilter.ABB) {
-                            "No verified AudioBookBay releases found yet. Expand any released card to check ABB on demand."
+                            "No verified unread AudioBookBay releases found yet. Tap [ CHECK ABB NOW ] above or expand any released card."
                         } else {
                             "No scheduled upcoming releases match [${quickFilter.label}].\nTap [ 2:TRACKED ] on the bottom bar to search the live catalog."
                         },
@@ -1414,6 +1878,8 @@ private fun UpcomingFeedView(
                     onMuteBook = { onMuteBook(card) },
                     onMuteSeries = { onMuteSeries(card) },
                     onMarkSeriesSeqRead = onMarkSeriesSeqRead,
+                    onMarkRead = { onMarkRead(card) },
+                    onTogglePin = { onTogglePin(card) },
                     onAutoCheckAbb = { cardItem ->
                         if (!cardItem.entity.abbAvailable && !cardItem.isFutureOrTba) {
                             onAutoCheckAbb(cardItem)
@@ -1453,6 +1919,8 @@ private fun UpcomingFeedView(
                         onMuteBook = { onMuteBook(card) },
                         onMuteSeries = { onMuteSeries(card) },
                         onMarkSeriesSeqRead = onMarkSeriesSeqRead,
+                        onMarkRead = { onMarkRead(card) },
+                        onTogglePin = { onTogglePin(card) },
                         onAutoCheckAbb = { cardItem ->
                             if (!cardItem.entity.abbAvailable && !cardItem.isFutureOrTba) {
                                 onAutoCheckAbb(cardItem)
@@ -1482,6 +1950,8 @@ private fun ReleaseScorecard(
     onMuteBook: () -> Unit,
     onMuteSeries: () -> Unit,
     onMarkSeriesSeqRead: (TrackedItemEntity, Int) -> Unit,
+    onMarkRead: () -> Unit = {},
+    onTogglePin: () -> Unit = {},
     onAutoCheckAbb: (ReleaseCardUiModel) -> Unit = {}
 ) {
     val palette = LocalPtsPalette.current
@@ -1499,6 +1969,8 @@ private fun ReleaseScorecard(
     val frameBorderColor = when {
         isExpanded -> palette.cyan
         rel.abbAvailable -> palette.green
+        card.isPinned -> palette.yellow
+        card.hasDateShift && card.isFutureOrTba -> palette.orange
         rel.isNewDiscovery && card.isFutureOrTba -> palette.pink
         else -> urgencyColor
     }
@@ -1580,6 +2052,21 @@ private fun ReleaseScorecard(
             fontSizeSp = 11
         )
 
+        // Quick 1-tap Mark Read on collapsed released/past cards
+        if (!isExpanded && !alwaysShowCardActions && card.isPastOrToday) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.End,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                BracketButton(
+                    label = "Mark Read",
+                    color = palette.green,
+                    onClick = onMarkRead
+                )
+            }
+        }
+
         if (isExpanded) {
             if (rel.previousReleaseDateIso.isNotBlank() && rel.previousReleaseDateIso != rel.releaseDateIso) {
                 AsciiLeaderRow(
@@ -1632,6 +2119,17 @@ private fun ReleaseScorecard(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
+                BracketButton(
+                    label = "Mark Read",
+                    color = palette.green,
+                    onClick = onMarkRead
+                )
+                BracketButton(
+                    label = if (card.isPinned) "Pinned" else "* Pin",
+                    active = card.isPinned,
+                    color = palette.yellow,
+                    onClick = onTogglePin
+                )
                 if (rel.seriesTitle.isNotBlank()) {
                     BracketButton(
                         label = if (card.isSeriesAlreadyTracked) "[x] Series" else "[+ Series]",
@@ -1667,13 +2165,6 @@ private fun ReleaseScorecard(
                                 onQuickTrack(TrackType.NARRATOR, card.primaryNarrator, rel.coverUrl, null)
                             }
                         }
-                    )
-                }
-                if (card.canMarkCurrentRead && card.matchedSeriesItem != null && rel.seriesSequence != null) {
-                    BracketButton(
-                        label = "[x] Mark #${rel.seriesSequence} Read",
-                        color = palette.green,
-                        onClick = { onMarkSeriesSeqRead(card.matchedSeriesItem, rel.seriesSequence) }
                     )
                 }
                 if (card.matchedStandaloneBookItem != null && !card.isFutureOrTba) {
@@ -1755,12 +2246,16 @@ private fun TrackedEntitiesView(
     today: LocalDate,
     trackedItems: List<TrackedItemEntity>,
     releases: List<ReleaseEntity>,
+    readAsins: Set<String>,
+    readGroupKeys: Set<String>,
+    localFilterQuery: String,
     sourceFilter: TrackedSourceFilter,
     sortOrder: TrackedSortOrder,
     hideCoverArt: Boolean,
     recentlyDeletedItem: TrackedItemEntity?,
     onAddTracked: (TrackType, String, Int, String, String?) -> Unit,
     onSelectSourceForFilter: (TrackedItemEntity) -> Unit,
+    onEditTracked: (TrackedItemEntity, String, Boolean) -> Unit,
     onDeleteTracked: (TrackedItemEntity) -> Unit,
     onUndoDelete: (TrackedItemEntity) -> Unit,
     onUpdateSeriesSeq: (TrackedItemEntity, Int) -> Unit,
@@ -1771,6 +2266,7 @@ private fun TrackedEntitiesView(
     val focusManager = LocalFocusManager.current
     val keyboardController = LocalSoftwareKeyboardController.current
     val todayIso = remember(today) { today.toString() }
+    val localQ = localFilterQuery.trim()
 
     var searchQuery by remember { mutableStateOf("") }
     var isSearchingCatalog by remember { mutableStateOf(false) }
@@ -1781,6 +2277,10 @@ private fun TrackedEntitiesView(
     var useDirectMode by remember { mutableStateOf(false) }
     var directType by remember { mutableStateOf(TrackType.SERIES) }
     var directLastRead by remember { mutableStateOf("0") }
+
+    // Inline in-place edit state for followed sources
+    var editingItemId by remember { mutableStateOf<Long?>(null) }
+    var editDraft by remember { mutableStateOf("") }
 
     // Two-tap inline delete guard (`[ x ]` -> `[ del? ]` auto-resetting after 3s)
     var pendingDeleteId by remember { mutableStateOf<Long?>(null) }
@@ -1793,8 +2293,11 @@ private fun TrackedEntitiesView(
 
     val searchSpinner = rememberAsciiSpinner(active = isSearchingCatalog)
 
-    val upcomingCountsByItemId = remember(trackedItems, releases, todayIso) {
-        val futureReleases = releases.filter { it.releaseDateIso == "TBA" || it.releaseDateIso >= todayIso }
+    val upcomingCountsByItemId = remember(trackedItems, releases, readAsins, readGroupKeys, todayIso) {
+        val futureReleases = releases.filter { rel ->
+            !ReleaseRepository.isReleaseRead(rel, readAsins, readGroupKeys) &&
+                (rel.releaseDateIso == "TBA" || rel.releaseDateIso >= todayIso)
+        }
         trackedItems.associate { item ->
             val count = futureReleases.count { rel ->
                 ReleaseRepository.releaseMatchesTrackedItem(rel, item)
@@ -1803,11 +2306,20 @@ private fun TrackedEntitiesView(
         }
     }
 
-    val filteredTrackedItems = remember(trackedItems, sourceFilter, sortOrder, upcomingCountsByItemId) {
-        val base = if (sourceFilter.trackType == null) {
+    val filteredTrackedItems = remember(trackedItems, sourceFilter, sortOrder, localQ, upcomingCountsByItemId) {
+        val byType = if (sourceFilter.trackType == null) {
             trackedItems
         } else {
             trackedItems.filter { it.type == sourceFilter.trackType }
+        }
+        val base = if (localQ.isBlank()) {
+            byType
+        } else {
+            byType.filter { item ->
+                item.queryValue.contains(localQ, ignoreCase = true) ||
+                    item.pinnedAuthor.contains(localQ, ignoreCase = true) ||
+                    item.type.name.contains(localQ, ignoreCase = true)
+            }
         }
         when (sortOrder) {
             TrackedSortOrder.A_TO_Z -> base.sortedWith(
@@ -2176,14 +2688,18 @@ private fun TrackedEntitiesView(
 
             // De-emphasize 0 UPCOMING rows to comment; highlight 1+ UPCOMING in green/typeAccent
             val headerTint = if (hasUpcoming) palette.green else palette.comment
-            val borderTint = if (hasUpcoming) typeAccent else palette.comment.copy(alpha = 0.6f)
+            val borderTint = if (editingItemId == item.id) palette.cyan else if (hasUpcoming) typeAccent else palette.comment.copy(alpha = 0.6f)
             val isConfirmingDelete = pendingDeleteId == item.id
+            val isEditing = editingItemId == item.id
 
             AsciiBox(
                 headerLabel = "${item.type.name} | $upcomingBadgeCount UPCOMING",
                 borderColor = borderTint,
                 headerColor = headerTint,
-                onClick = { onSelectSourceForFilter(item) }
+                animateSizeChange = true,
+                onClick = {
+                    if (!isEditing) onSelectSourceForFilter(item)
+                }
             ) {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -2233,6 +2749,19 @@ private fun TrackedEntitiesView(
                                 onClick = { onUpdateSeriesSeq(item, item.lastReadSequence + 1) }
                             )
                         }
+                        BracketButton(
+                            label = "e",
+                            color = if (isEditing) palette.cyan else palette.comment,
+                            active = isEditing,
+                            onClick = {
+                                if (isEditing) {
+                                    editingItemId = null
+                                } else {
+                                    editingItemId = item.id
+                                    editDraft = item.queryValue
+                                }
+                            }
+                        )
                         if (isConfirmingDelete) {
                             AsciiInvertButton(
                                 label = "del?",
@@ -2241,6 +2770,7 @@ private fun TrackedEntitiesView(
                                 hapticType = HapticFeedbackType.LongPress,
                                 onClick = {
                                     pendingDeleteId = null
+                                    if (editingItemId == item.id) editingItemId = null
                                     onDeleteTracked(item)
                                 }
                             )
@@ -2251,6 +2781,58 @@ private fun TrackedEntitiesView(
                                 onClick = { pendingDeleteId = item.id }
                             )
                         }
+                    }
+                }
+                if (isEditing) {
+                    Spacer(modifier = Modifier.height(6.dp))
+                    AsciiRule(pattern = "- ")
+                    Spacer(modifier = Modifier.height(4.dp))
+                    AsciiTextField(
+                        value = editDraft,
+                        onValueChange = { editDraft = it },
+                        placeholder = "Edit ${item.type.name.lowercase()} name...",
+                        imeAction = ImeAction.Done,
+                        onImeAction = {
+                            if (editDraft.isNotBlank()) {
+                                focusManager.clearFocus()
+                                keyboardController?.hide()
+                                editingItemId = null
+                                onEditTracked(item, editDraft, false)
+                            }
+                        }
+                    )
+                    Spacer(modifier = Modifier.height(4.dp))
+                    FlowRow(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        BracketButton(
+                            label = "SAVE",
+                            color = palette.green,
+                            onClick = {
+                                if (editDraft.isNotBlank()) {
+                                    focusManager.clearFocus()
+                                    keyboardController?.hide()
+                                    editingItemId = null
+                                    onEditTracked(item, editDraft, false)
+                                }
+                            }
+                        )
+                        BracketButton(
+                            label = "REFRESH META",
+                            color = palette.cyan,
+                            onClick = {
+                                focusManager.clearFocus()
+                                keyboardController?.hide()
+                                editingItemId = null
+                                onEditTracked(item, editDraft.ifBlank { item.queryValue }, true)
+                            }
+                        )
+                        BracketButton(
+                            label = "CANCEL",
+                            color = palette.comment,
+                            onClick = { editingItemId = null }
+                        )
                     }
                 }
             }
@@ -2265,7 +2847,9 @@ private fun SettingsAndBackupView(
     prefs: FilterPrefs,
     syncTelemetry: SyncTelemetry,
     isSyncing: Boolean,
+    isCheckingAbbBatch: Boolean,
     syncProgress: SyncProgressState,
+    onRunManualAbbCheck: () -> Unit,
     onUpdatePrefs: (FilterPrefs) -> Unit,
     onPostStatus: (String, Boolean) -> Unit,
     onOpenAbout: () -> Unit,
@@ -2274,6 +2858,7 @@ private fun SettingsAndBackupView(
 ) {
     val palette = LocalPtsPalette.current
     val scope = rememberCoroutineScope()
+    val abbSpinner = rememberAsciiSpinner(active = isCheckingAbbBatch)
 
     var cacheStats by remember { mutableStateOf(CacheStats(0, 0L)) }
     LaunchedEffect(isSyncing) {
@@ -2432,10 +3017,15 @@ private fun SettingsAndBackupView(
                 Spacer(modifier = Modifier.height(6.dp))
                 AsciiRule(pattern = "- ")
                 Spacer(modifier = Modifier.height(4.dp))
-                Row(
+                FlowRow(
                     modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.End
+                    horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End)
                 ) {
+                    BracketButton(
+                        label = if (isCheckingAbbBatch) "$abbSpinner CHECKING ABB" else "CHECK ABB NOW",
+                        color = palette.green,
+                        onClick = onRunManualAbbCheck
+                    )
                     BracketButton(
                         label = "CLEAR CACHE",
                         color = palette.red,
@@ -2456,7 +3046,7 @@ private fun SettingsAndBackupView(
             AsciiBox(headerLabel = "PLAIN-TEXT JSON BACKUP & RESTORE") {
                 AsciiLeaderRow(
                     key = "Backup Format",
-                    value = "Schema v8 (.json)",
+                    value = "Schema v9 (.json)",
                     valueColor = palette.comment,
                     fontSizeSp = 11
                 )

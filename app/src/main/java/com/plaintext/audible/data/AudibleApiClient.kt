@@ -513,6 +513,14 @@ object AudibleApiClient {
         CacheStats(0, 0L)
     }
 
+    fun evictPortraitCache(name: String) {
+        val cleaned = cleanContributorName(name).lowercase(Locale.US)
+        if (cleaned.isNotBlank()) {
+            personPortraitCache.remove("audible_author_v31:$cleaned")
+            personPortraitCache.remove("narrator:$cleaned")
+        }
+    }
+
     /**
      * Fetches the verified author portrait URL from Audnexus or Audible's author page.
      * Strictly verifies that the returned author `name` matches `authorName` (punctuation-normalized)

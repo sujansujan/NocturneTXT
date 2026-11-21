@@ -91,11 +91,53 @@ interface TrackerDao {
 
     @Query("UPDATE releases SET notifiedAbbAvailable = :notified WHERE asin = :asin")
     suspend fun updateAbbNotifiedFlag(asin: String, notified: Boolean)
+
+    @Query("UPDATE releases SET notifiedDateShift = :notified WHERE asin = :asin")
+    suspend fun updateDateShiftNotified(asin: String, notified: Boolean)
+
+    @Query("UPDATE releases SET notifiedNarratorAnnounced = :notified WHERE asin = :asin")
+    suspend fun updateNarratorNotified(asin: String, notified: Boolean)
+
+    @Query("SELECT * FROM read_books ORDER BY readAtEpochMs DESC")
+    fun observeReadBooks(): Flow<List<ReadBookEntity>>
+
+    @Query("SELECT * FROM read_books ORDER BY readAtEpochMs DESC")
+    suspend fun getAllReadBooks(): List<ReadBookEntity>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertReadBook(book: ReadBookEntity)
+
+    @Query("DELETE FROM read_books WHERE asin = :asin")
+    suspend fun deleteReadBookByAsin(asin: String)
+
+    @Query("DELETE FROM read_books WHERE groupKey = :groupKey AND groupKey != ''")
+    suspend fun deleteReadBookByGroupKey(groupKey: String)
+
+    @Query("SELECT * FROM pinned_releases ORDER BY createdAt DESC")
+    fun observePinnedReleases(): Flow<List<PinnedReleaseEntity>>
+
+    @Query("SELECT * FROM pinned_releases")
+    suspend fun getAllPinnedReleases(): List<PinnedReleaseEntity>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertPinnedRelease(pin: PinnedReleaseEntity)
+
+    @Query("DELETE FROM pinned_releases WHERE asin = :asin")
+    suspend fun deletePinnedReleaseByAsin(asin: String)
+
+    @Query("DELETE FROM pinned_releases WHERE groupKey = :groupKey AND groupKey != ''")
+    suspend fun deletePinnedReleaseByGroupKey(groupKey: String)
 }
 
 @Database(
-    entities = [TrackedItemEntity::class, DndRuleEntity::class, ReleaseEntity::class],
-    version = 7,
+    entities = [
+        TrackedItemEntity::class,
+        DndRuleEntity::class,
+        ReleaseEntity::class,
+        ReadBookEntity::class,
+        PinnedReleaseEntity::class
+    ],
+    version = 8,
     exportSchema = false
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -159,6 +201,41 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
+        private val MIGRATION_7_8 = object : Migration(7, 8) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE releases ADD COLUMN notifiedDateShift INTEGER NOT NULL DEFAULT 0")
+                db.execSQL("ALTER TABLE releases ADD COLUMN notifiedNarratorAnnounced INTEGER NOT NULL DEFAULT 0")
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS read_books (
+                        asin TEXT NOT NULL PRIMARY KEY,
+                        groupKey TEXT NOT NULL,
+                        title TEXT NOT NULL,
+                        authors TEXT NOT NULL,
+                        narrators TEXT NOT NULL,
+                        seriesTitle TEXT NOT NULL,
+                        seriesAsin TEXT NOT NULL,
+                        seriesSequence INTEGER,
+                        runtimeMinutes INTEGER NOT NULL,
+                        coverUrl TEXT NOT NULL,
+                        releaseDateIso TEXT NOT NULL,
+                        readAtEpochMs INTEGER NOT NULL
+                    )
+                    """.trimIndent()
+                )
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS pinned_releases (
+                        asin TEXT NOT NULL PRIMARY KEY,
+                        groupKey TEXT NOT NULL,
+                        title TEXT NOT NULL,
+                        createdAt INTEGER NOT NULL
+                    )
+                    """.trimIndent()
+                )
+            }
+        }
+
         fun get(context: Context): AppDatabase {
             return INSTANCE ?: synchronized(this) {
                 Room.databaseBuilder(
@@ -172,7 +249,8 @@ abstract class AppDatabase : RoomDatabase() {
                         MIGRATION_3_4,
                         MIGRATION_4_5,
                         MIGRATION_5_6,
-                        MIGRATION_6_7
+                        MIGRATION_6_7,
+                        MIGRATION_7_8
                     )
                     .fallbackToDestructiveMigration()
                     .build()

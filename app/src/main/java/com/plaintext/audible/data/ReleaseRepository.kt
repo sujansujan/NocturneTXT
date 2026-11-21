@@ -97,6 +97,14 @@ data class FilterPrefs(
         get() = ThemeMode.fromCode(themeModeCode)
 }
 
+@Immutable
+data class MarkReadOutcome(
+    val readBook: ReadBookEntity,
+    val archivedTrackedBook: TrackedItemEntity? = null,
+    val previousSeriesSequences: List<Pair<Long, Int>> = emptyList(),
+    val wasPinned: PinnedReleaseEntity? = null
+)
+
 class ReleaseRepository(context: Context) {
     private val db = AppDatabase.get(context)
     val dao = db.dao()
@@ -112,6 +120,9 @@ class ReleaseRepository(context: Context) {
     private val _isSyncing = MutableStateFlow(false)
     val isSyncing: StateFlow<Boolean> = _isSyncing.asStateFlow()
 
+    private val _isCheckingAbb = MutableStateFlow(false)
+    val isCheckingAbb: StateFlow<Boolean> = _isCheckingAbb.asStateFlow()
+
     private val _prefsFlow = MutableStateFlow(readPrefs())
     val prefsFlow: StateFlow<FilterPrefs> = _prefsFlow.asStateFlow()
 
@@ -120,6 +131,53 @@ class ReleaseRepository(context: Context) {
 
     companion object {
         private const val ABB_DAILY_INTERVAL_MS = 20L * 60L * 60L * 1000L
+
+        fun normalizeTitleForGrouping(rawTitle: String): String {
+            val beforeColon = rawTitle.substringBefore(":").trim().ifBlank { rawTitle }
+            return beforeColon.lowercase(Locale.US)
+                .replace(Regex("\\(.*?\\)"), "")
+                .replace(Regex("\\[.*?\\]"), "")
+                .replace(Regex("\\bbook\\s+viii\\b"), "book 8")
+                .replace(Regex("\\bbook\\s+vii\\b"), "book 7")
+                .replace(Regex("\\bbook\\s+vi\\b"), "book 6")
+                .replace(Regex("\\bbook\\s+iv\\b"), "book 4")
+                .replace(Regex("\\bbook\\s+v\\b"), "book 5")
+                .replace(Regex("\\bbook\\s+iii\\b"), "book 3")
+                .replace(Regex("\\bbook\\s+ii\\b"), "book 2")
+                .replace(Regex("\\bbook\\s+i\\b"), "book 1")
+                .replace(Regex("[^a-z0-9]"), "")
+        }
+
+        fun computeGroupKey(title: String, authors: String): String {
+            val normT = normalizeTitleForGrouping(title)
+            val normA = authors.split(",").firstOrNull()?.lowercase(Locale.US)
+                ?.replace(Regex("[^a-z0-9]"), "") ?: ""
+            return "${normT}_${normA}"
+        }
+
+        fun isReleaseRead(
+            rel: ReleaseEntity,
+            readAsins: Set<String>,
+            readGroupKeys: Set<String>
+        ): Boolean {
+            if (rel.asin.lowercase(Locale.US) in readAsins) return true
+            if (rel.altAsins.isNotBlank()) {
+                val anyAlt = rel.altAsins.split(",").any { it.trim().lowercase(Locale.US) in readAsins }
+                if (anyAlt) return true
+            }
+            val gk = computeGroupKey(rel.title, rel.authors)
+            return gk.isNotBlank() && gk in readGroupKeys
+        }
+
+        fun isReleasePinned(
+            rel: ReleaseEntity,
+            pinnedAsins: Set<String>,
+            pinnedGroupKeys: Set<String>
+        ): Boolean {
+            if (rel.asin.lowercase(Locale.US) in pinnedAsins) return true
+            val gk = computeGroupKey(rel.title, rel.authors)
+            return gk.isNotBlank() && gk in pinnedGroupKeys
+        }
 
         fun matchesPersonNameExactOrWordBoundary(candidateName: String, targetQuery: String): Boolean {
             val cand = candidateName.trim()
@@ -298,22 +356,6 @@ class ReleaseRepository(context: Context) {
         val editionAsins: MutableSet<String> = linkedSetOf()
     )
 
-    private fun normalizeTitleForGrouping(rawTitle: String): String {
-        val beforeColon = rawTitle.substringBefore(":").trim().ifBlank { rawTitle }
-        return beforeColon.lowercase(Locale.US)
-            .replace(Regex("\\(.*?\\)"), "")
-            .replace(Regex("\\[.*?\\]"), "")
-            .replace(Regex("\\bbook\\s+viii\\b"), "book 8")
-            .replace(Regex("\\bbook\\s+vii\\b"), "book 7")
-            .replace(Regex("\\bbook\\s+vi\\b"), "book 6")
-            .replace(Regex("\\bbook\\s+iv\\b"), "book 4")
-            .replace(Regex("\\bbook\\s+v\\b"), "book 5")
-            .replace(Regex("\\bbook\\s+iii\\b"), "book 3")
-            .replace(Regex("\\bbook\\s+ii\\b"), "book 2")
-            .replace(Regex("\\bbook\\s+i\\b"), "book 1")
-            .replace(Regex("[^a-z0-9]"), "")
-    }
-
     private fun mergeDuplicateEditions(existing: CatalogProduct, candidate: CatalogProduct): CatalogProduct {
         val chosenCover = when {
             existing.coverUrl.isNotBlank() && candidate.coverUrl.isBlank() -> existing.coverUrl
@@ -377,7 +419,7 @@ class ReleaseRepository(context: Context) {
 
     suspend fun checkPendingAbbReleases(forceAbbCheck: Boolean = false): List<ReleaseEntity> {
         val filterPrefs = getPrefs()
-        if (!filterPrefs.checkAbbDaily) return dao.getAllReleases()
+        if (!forceAbbCheck && !filterPrefs.checkAbbDaily) return dao.getAllReleases()
 
         val nowMs = System.currentTimeMillis()
         val lastAbbCheckMs = prefs.getLong("last_abb_check_ms", 0L)
@@ -385,10 +427,17 @@ class ReleaseRepository(context: Context) {
             return dao.getAllReleases()
         }
 
+        val readBooks = dao.getAllReadBooks()
+        val readAsins = readBooks.map { it.asin.lowercase(Locale.US) }.toSet()
+        val readGroupKeys = readBooks.mapNotNull { it.groupKey.takeIf { gk -> gk.isNotBlank() } }.toSet()
+
         val todayIso = LocalDate.now().toString()
         val candidates = dao.getAllReleases()
             .filter { rel ->
-                !rel.abbAvailable && rel.releaseDateIso != "TBA" && rel.releaseDateIso <= todayIso
+                !rel.abbAvailable &&
+                    rel.releaseDateIso != "TBA" &&
+                    rel.releaseDateIso <= todayIso &&
+                    !isReleaseRead(rel, readAsins, readGroupKeys)
             }
             .sortedByDescending { it.releaseDateIso }
 
@@ -398,30 +447,41 @@ class ReleaseRepository(context: Context) {
         }
 
         abbSemaphore.withPermit {
-            for ((index, rel) in candidates.take(10).withIndex()) {
-                if (index > 0) {
-                    delay(1400L)
-                }
-                val match = AudibleApiClient.checkAudioBookBayAvailability(
-                    bookTitle = rel.title,
-                    allAuthors = rel.authors,
-                    releaseDateIso = rel.releaseDateIso,
-                    seriesTitle = rel.seriesTitle,
-                    seriesSequence = rel.seriesSequence
-                )
-                if (match.available) {
-                    dao.updateAbbAvailability(
-                        asin = rel.asin,
-                        available = true,
-                        postUrl = match.postUrl,
-                        magnetUri = match.magnetUri
+            _isCheckingAbb.value = true
+            try {
+                for ((index, rel) in candidates.take(10).withIndex()) {
+                    if (index > 0) {
+                        delay(1400L)
+                    }
+                    val match = AudibleApiClient.checkAudioBookBayAvailability(
+                        bookTitle = rel.title,
+                        allAuthors = rel.authors,
+                        releaseDateIso = rel.releaseDateIso,
+                        seriesTitle = rel.seriesTitle,
+                        seriesSequence = rel.seriesSequence
                     )
+                    if (match.available) {
+                        dao.updateAbbAvailability(
+                            asin = rel.asin,
+                            available = true,
+                            postUrl = match.postUrl,
+                            magnetUri = match.magnetUri
+                        )
+                    }
                 }
+            } finally {
+                _isCheckingAbb.value = false
             }
         }
 
         prefs.edit().putLong("last_abb_check_ms", nowMs).apply()
         return dao.getAllReleases()
+    }
+
+    suspend fun runManualAbbCheck(): Int {
+        val beforeCount = dao.getAllReleases().count { it.abbAvailable }
+        val after = checkPendingAbbReleases(forceAbbCheck = true)
+        return (after.count { it.abbAvailable } - beforeCount).coerceAtLeast(0)
     }
 
     suspend fun syncCatalog(forceRefresh: Boolean = false): List<ReleaseEntity> = syncMutex.withLock {
@@ -745,15 +805,21 @@ class ReleaseRepository(context: Context) {
 
             val newNarratorsStr = prod.narrators.joinToString(", ").ifBlank { "TBA" }
 
+            val didDateShiftNow = prev != null &&
+                prev.releaseDateIso != prod.releaseDateIso &&
+                prev.releaseDateIso.isNotBlank()
             val shiftedFromDate = when {
                 prev == null -> ""
-                prev.releaseDateIso != prod.releaseDateIso && prev.releaseDateIso.isNotBlank() -> prev.releaseDateIso
+                didDateShiftNow -> prev.releaseDateIso
                 else -> prev.previousReleaseDateIso
             }
 
+            val didNarratorAnnounceNow = prev != null &&
+                prev.narrators.equals("TBA", ignoreCase = true) &&
+                !newNarratorsStr.equals("TBA", ignoreCase = true)
             val narratorNewlyAnnounced = when {
                 prev == null -> false
-                prev.narrators.equals("TBA", ignoreCase = true) && !newNarratorsStr.equals("TBA", ignoreCase = true) -> true
+                didNarratorAnnounceNow -> true
                 else -> prev.narratorJustAnnounced
             }
 
@@ -785,7 +851,9 @@ class ReleaseRepository(context: Context) {
                 abbAvailable = prev?.abbAvailable ?: false,
                 abbPostUrl = prev?.abbPostUrl ?: "",
                 abbMagnetUri = prev?.abbMagnetUri ?: "",
-                notifiedAbbAvailable = prev?.notifiedAbbAvailable ?: false
+                notifiedAbbAvailable = prev?.notifiedAbbAvailable ?: false,
+                notifiedDateShift = if (didDateShiftNow) false else (prev?.notifiedDateShift ?: false),
+                notifiedNarratorAnnounced = if (didNarratorAnnounceNow) false else (prev?.notifiedNarratorAnnounced ?: false)
             )
         }
 
@@ -808,6 +876,141 @@ class ReleaseRepository(context: Context) {
         )
 
         return checkPendingAbbReleases(forceAbbCheck = forceRefresh)
+    }
+
+    suspend fun markReleaseRead(rel: ReleaseEntity): MarkReadOutcome {
+        val groupKey = computeGroupKey(rel.title, rel.authors)
+        val readBook = ReadBookEntity(
+            asin = rel.asin,
+            groupKey = groupKey,
+            title = rel.title,
+            authors = rel.authors,
+            narrators = rel.narrators,
+            seriesTitle = rel.seriesTitle,
+            seriesAsin = rel.seriesAsin,
+            seriesSequence = rel.seriesSequence,
+            runtimeMinutes = rel.runtimeMinutes,
+            coverUrl = rel.coverUrl,
+            releaseDateIso = rel.releaseDateIso,
+            readAtEpochMs = System.currentTimeMillis()
+        )
+        dao.upsertReadBook(readBook)
+
+        // Advance lastReadSequence on any matching tracked SERIES
+        val allTracked = dao.getAllTrackedItems()
+        val updatedSeriesPrev = mutableListOf<Pair<Long, Int>>()
+        val seq = rel.seriesSequence
+        if (rel.seriesTitle.isNotBlank() && seq != null) {
+            allTracked.filter { it.type == TrackType.SERIES }.forEach { s ->
+                if (releaseMatchesTrackedItem(rel, s) && seq > s.lastReadSequence) {
+                    updatedSeriesPrev += (s.id to s.lastReadSequence)
+                    dao.updateSeriesReadSequence(s.id, seq)
+                }
+            }
+        }
+
+        // Auto-complete standalone tracked BOOK if matched
+        val matchedBook = allTracked.firstOrNull {
+            it.type == TrackType.BOOK && releaseMatchesTrackedItem(rel, it)
+        }
+        if (matchedBook != null) {
+            dao.deleteTrackedItem(matchedBook)
+        }
+
+        // Clear any pin on this release (store for undo)
+        val existingPin = dao.getAllPinnedReleases().firstOrNull {
+            it.asin.equals(rel.asin, ignoreCase = true) ||
+                (it.groupKey.isNotBlank() && it.groupKey == groupKey)
+        }
+        if (existingPin != null) {
+            dao.deletePinnedReleaseByAsin(existingPin.asin)
+            if (groupKey.isNotBlank()) dao.deletePinnedReleaseByGroupKey(groupKey)
+        }
+
+        return MarkReadOutcome(
+            readBook = readBook,
+            archivedTrackedBook = matchedBook,
+            previousSeriesSequences = updatedSeriesPrev,
+            wasPinned = existingPin
+        )
+    }
+
+    suspend fun undoMarkRead(outcome: MarkReadOutcome) {
+        dao.deleteReadBookByAsin(outcome.readBook.asin)
+        if (outcome.readBook.groupKey.isNotBlank()) {
+            dao.deleteReadBookByGroupKey(outcome.readBook.groupKey)
+        }
+        outcome.previousSeriesSequences.forEach { (seriesId, prevSeq) ->
+            dao.updateSeriesReadSequence(seriesId, prevSeq)
+        }
+        if (outcome.archivedTrackedBook != null) {
+            dao.insertTrackedItem(outcome.archivedTrackedBook)
+        }
+        if (outcome.wasPinned != null) {
+            dao.upsertPinnedRelease(outcome.wasPinned)
+        }
+    }
+
+    suspend fun unmarkReadBook(book: ReadBookEntity) {
+        dao.deleteReadBookByAsin(book.asin)
+        if (book.groupKey.isNotBlank()) {
+            dao.deleteReadBookByGroupKey(book.groupKey)
+        }
+    }
+
+    suspend fun togglePinRelease(rel: ReleaseEntity): Boolean {
+        val groupKey = computeGroupKey(rel.title, rel.authors)
+        val existingPins = dao.getAllPinnedReleases()
+        val matched = existingPins.firstOrNull {
+            it.asin.equals(rel.asin, ignoreCase = true) ||
+                (it.groupKey.isNotBlank() && it.groupKey == groupKey)
+        }
+        return if (matched != null) {
+            dao.deletePinnedReleaseByAsin(matched.asin)
+            if (groupKey.isNotBlank()) dao.deletePinnedReleaseByGroupKey(groupKey)
+            false
+        } else {
+            dao.upsertPinnedRelease(
+                PinnedReleaseEntity(
+                    asin = rel.asin,
+                    groupKey = groupKey,
+                    title = rel.title,
+                    createdAt = System.currentTimeMillis()
+                )
+            )
+            true
+        }
+    }
+
+    suspend fun editTrackedItemAndRefresh(
+        item: TrackedItemEntity,
+        rawNewQuery: String,
+        refreshMetadata: Boolean
+    ): Boolean {
+        val cleaned = if (item.type == TrackType.AUTHOR || item.type == TrackType.NARRATOR || item.type == TrackType.SERIES) {
+            AudibleApiClient.formatCanonicalName(rawNewQuery)
+        } else {
+            rawNewQuery.trim()
+        }
+        if (cleaned.isBlank()) return false
+
+        val nameChanged = !cleaned.equals(item.queryValue.trim(), ignoreCase = true)
+        val existingDup = if (nameChanged) dao.findTrackedItem(item.type, cleaned) else null
+        if (existingDup != null && existingDup.id != item.id) return false
+
+        val clearMeta = nameChanged || refreshMetadata
+        if (clearMeta) {
+            AudibleApiClient.evictPortraitCache(item.queryValue)
+            AudibleApiClient.evictPortraitCache(cleaned)
+        }
+
+        dao.updateTrackedItemDetails(
+            id = item.id,
+            queryValue = cleaned,
+            extId = if (clearMeta) null else item.externalId,
+            url = if (clearMeta) "" else item.thumbnailUrl
+        )
+        return true
     }
 
     suspend fun muteBook(asin: String, title: String) {

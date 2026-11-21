@@ -8,7 +8,7 @@ object BackupManager {
         val root = JSONObject()
         val prefs = repo.getPrefs()
 
-        root.put("version", 8)
+        root.put("version", 9)
         root.put("prefs", JSONObject().apply {
             put("englishOnly", prefs.englishOnly)
             put("hideAbridged", prefs.hideAbridged)
@@ -43,6 +43,36 @@ object BackupManager {
             })
         }
         root.put("dndRules", dndArr)
+
+        val readArr = JSONArray()
+        for (r in repo.dao.getAllReadBooks()) {
+            readArr.put(JSONObject().apply {
+                put("asin", r.asin)
+                put("groupKey", r.groupKey)
+                put("title", r.title)
+                put("authors", r.authors)
+                put("narrators", r.narrators)
+                put("seriesTitle", r.seriesTitle)
+                put("seriesAsin", r.seriesAsin)
+                if (r.seriesSequence != null) put("seriesSequence", r.seriesSequence)
+                put("runtimeMinutes", r.runtimeMinutes)
+                put("coverUrl", r.coverUrl)
+                put("releaseDateIso", r.releaseDateIso)
+                put("readAtEpochMs", r.readAtEpochMs)
+            })
+        }
+        root.put("readBooks", readArr)
+
+        val pinnedArr = JSONArray()
+        for (pin in repo.dao.getAllPinnedReleases()) {
+            pinnedArr.put(JSONObject().apply {
+                put("asin", pin.asin)
+                put("groupKey", pin.groupKey)
+                put("title", pin.title)
+                put("createdAt", pin.createdAt)
+            })
+        }
+        root.put("pinnedReleases", pinnedArr)
 
         return root.toString(2)
     }
@@ -100,6 +130,55 @@ object BackupManager {
                         targetKey = targetKey,
                         targetType = targetType,
                         displayTitle = o.optString("displayTitle", targetKey)
+                    )
+                )
+            }
+        }
+
+        root.optJSONArray("readBooks")?.let { arr ->
+            for (i in 0 until arr.length()) {
+                val o = arr.optJSONObject(i) ?: continue
+                val asin = o.optString("asin", "").trim()
+                val title = o.optString("title", "").trim()
+                if (asin.isBlank() || title.isBlank()) continue
+                val authors = o.optString("authors", "")
+                val groupKey = o.optString("groupKey", "").ifBlank {
+                    ReleaseRepository.computeGroupKey(title, authors)
+                }
+                val seq = if (o.has("seriesSequence") && !o.isNull("seriesSequence")) {
+                    o.optInt("seriesSequence")
+                } else null
+                repo.dao.upsertReadBook(
+                    ReadBookEntity(
+                        asin = asin,
+                        groupKey = groupKey,
+                        title = title,
+                        authors = authors,
+                        narrators = o.optString("narrators", ""),
+                        seriesTitle = o.optString("seriesTitle", ""),
+                        seriesAsin = o.optString("seriesAsin", ""),
+                        seriesSequence = seq,
+                        runtimeMinutes = o.optInt("runtimeMinutes", 0).coerceAtLeast(0),
+                        coverUrl = o.optString("coverUrl", ""),
+                        releaseDateIso = o.optString("releaseDateIso", ""),
+                        readAtEpochMs = o.optLong("readAtEpochMs", System.currentTimeMillis())
+                    )
+                )
+            }
+        }
+
+        root.optJSONArray("pinnedReleases")?.let { arr ->
+            for (i in 0 until arr.length()) {
+                val o = arr.optJSONObject(i) ?: continue
+                val asin = o.optString("asin", "").trim()
+                val title = o.optString("title", "").trim()
+                if (asin.isBlank() || title.isBlank()) continue
+                repo.dao.upsertPinnedRelease(
+                    PinnedReleaseEntity(
+                        asin = asin,
+                        groupKey = o.optString("groupKey", ""),
+                        title = title,
+                        createdAt = o.optLong("createdAt", System.currentTimeMillis())
                     )
                 )
             }

@@ -15,6 +15,7 @@ import java.time.Duration
 import java.time.LocalDate
 import java.time.LocalDateTime
 import java.time.temporal.ChronoUnit
+import java.util.Locale
 import java.util.concurrent.TimeUnit
 
 class ReleaseCheckWorker(
@@ -25,22 +26,56 @@ class ReleaseCheckWorker(
     override suspend fun doWork(): Result {
         val repo = ReleaseRepository(applicationContext)
         val releases = repo.syncCatalog(forceRefresh = true)
+        val readBooks = repo.dao.getAllReadBooks()
+        val readAsins = readBooks.map { it.asin.lowercase(Locale.US) }.toSet()
+        val readGroupKeys = readBooks.mapNotNull { it.groupKey.takeIf { gk -> gk.isNotBlank() } }.toSet()
         val domain = repo.getPrefs().marketplace.domain
         val today = LocalDate.now()
 
         ensureChannel()
 
         for (rel in releases) {
-            val relDate = runCatching { LocalDate.parse(rel.releaseDateIso) }.getOrNull() ?: continue
-            val daysUntil = ChronoUnit.DAYS.between(today, relDate)
+            if (ReleaseRepository.isReleaseRead(rel, readAsins, readGroupKeys)) continue
 
-            if (daysUntil in 1L..7L && !rel.notifiedSevenDay) {
-                val tag = if (daysUntil == 1L) "[T-1 DAY]" else "[T-${daysUntil} DAYS]"
-                sendReleaseNotification(rel, domain, tag = tag, targetUrl = null)
-                repo.dao.updateNotificationFlags(rel.asin, sevenDay = true, releaseDay = rel.notifiedReleaseDay)
-            } else if (daysUntil == 0L && !rel.notifiedReleaseDay) {
-                sendReleaseNotification(rel, domain, tag = "[OUT TODAY]", targetUrl = null)
-                repo.dao.updateNotificationFlags(rel.asin, sevenDay = rel.notifiedSevenDay, releaseDay = true)
+            val relDate = runCatching { LocalDate.parse(rel.releaseDateIso) }.getOrNull()
+            val daysUntil = relDate?.let { ChronoUnit.DAYS.between(today, it) }
+
+            if (daysUntil != null) {
+                if (daysUntil in 1L..7L && !rel.notifiedSevenDay) {
+                    val tag = if (daysUntil == 1L) "[T-1 DAY]" else "[T-${daysUntil} DAYS]"
+                    sendReleaseNotification(rel, domain, tag = tag, targetUrl = null)
+                    repo.dao.updateNotificationFlags(rel.asin, sevenDay = true, releaseDay = rel.notifiedReleaseDay)
+                } else if (daysUntil == 0L && !rel.notifiedReleaseDay) {
+                    sendReleaseNotification(rel, domain, tag = "[OUT TODAY]", targetUrl = null)
+                    repo.dao.updateNotificationFlags(rel.asin, sevenDay = rel.notifiedSevenDay, releaseDay = true)
+                }
+            }
+
+            val isFutureOrTba = daysUntil == null || daysUntil >= 0L
+            if (isFutureOrTba &&
+                rel.previousReleaseDateIso.isNotBlank() &&
+                rel.previousReleaseDateIso != rel.releaseDateIso &&
+                !rel.notifiedDateShift
+            ) {
+                sendReleaseNotification(
+                    rel = rel,
+                    domain = domain,
+                    tag = "[DATE MOVED]",
+                    targetUrl = null,
+                    customBody = "Moved ${rel.previousReleaseDateIso} -> ${rel.releaseDateIso} | By ${rel.authors}"
+                )
+                repo.dao.updateDateShiftNotified(rel.asin, notified = true)
+            }
+
+            if (isFutureOrTba && rel.narratorJustAnnounced && !rel.notifiedNarratorAnnounced) {
+                sendReleaseNotification(
+                    rel = rel,
+                    domain = domain,
+                    tag = "[NARRATOR]",
+                    targetUrl = null,
+                    customBody = "Narrator announced: ${rel.narrators} | By ${rel.authors}"
+                )
+                repo.dao.updateNarratorNotified(rel.asin, notified = true)
             }
 
             if (rel.abbAvailable && !rel.notifiedAbbAvailable) {
@@ -60,10 +95,10 @@ class ReleaseCheckWorker(
         val nm = applicationContext.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         val channel = NotificationChannel(
             CHANNEL_ID,
-            "Release & ABB Alerts (T-7d, T-0d, ABB)",
+            "Release & ABB Alerts (T-7d, T-0d, ABB, Changes)",
             NotificationManager.IMPORTANCE_DEFAULT
         ).apply {
-            description = "Notifications 1 week before, on release day, and when found on AudioBookBay"
+            description = "Notifications for upcoming drops, release date shifts, narrator announcements, and AudioBookBay"
         }
         nm.createNotificationChannel(channel)
     }
@@ -72,14 +107,15 @@ class ReleaseCheckWorker(
         rel: ReleaseEntity,
         domain: String,
         tag: String,
-        targetUrl: String?
+        targetUrl: String?,
+        customBody: String? = null
     ) {
         val nm = applicationContext.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         val notifId = (rel.asin + tag).hashCode()
 
         val title = "$tag ${rel.title}"
         val seriesPart = if (rel.seriesTitle.isNotBlank()) " (${rel.seriesTitle})" else ""
-        val body = "By ${rel.authors} | Narrated by ${rel.narrators}$seriesPart"
+        val body = customBody ?: "By ${rel.authors} | Narrated by ${rel.narrators}$seriesPart"
 
         val url = targetUrl ?: run {
             val query = URLEncoder.encode("${rel.title} ${rel.authors.split(",").firstOrNull().orEmpty()}", "UTF-8")
