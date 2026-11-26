@@ -13,7 +13,9 @@ import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -21,12 +23,14 @@ import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
@@ -192,6 +196,7 @@ fun TrackerScreen(
     var recentlyDeletedItem by remember { mutableStateOf<TrackedItemEntity?>(null) }
     var recentlyMarkedRead by remember { mutableStateOf<MarkReadOutcome?>(null) }
     var checkingAbbAsins by remember { mutableStateOf<Set<String>>(emptySet()) }
+    var actionSheetAsin by remember { mutableStateOf<String?>(null) }
 
     val upcomingListState = rememberLazyListState()
     val trackedListState = rememberLazyListState()
@@ -305,7 +310,8 @@ fun TrackerScreen(
         }
     }
 
-    val shouldInterceptBack = activeSharedQuery != null ||
+    val shouldInterceptBack = actionSheetAsin != null ||
+        activeSharedQuery != null ||
         localFilterOpen ||
         localFilterQuery.isNotBlank() ||
         showAboutPage ||
@@ -315,6 +321,9 @@ fun TrackerScreen(
 
     BackHandler(enabled = shouldInterceptBack) {
         when {
+            actionSheetAsin != null -> {
+                actionSheetAsin = null
+            }
             activeSharedQuery != null -> {
                 activeSharedQuery = null
                 sharedResolution = null
@@ -724,6 +733,9 @@ fun TrackerScreen(
                                         false
                                     )
                                 }
+                            },
+                            onOpenActionMenu = { cardItem ->
+                                actionSheetAsin = cardItem.entity.asin
                             }
                         )
 
@@ -861,6 +873,291 @@ fun TrackerScreen(
                 onSelectTab = navigateToTab,
                 modifier = Modifier.align(Alignment.BottomCenter)
             )
+
+            val sheetRelease = remember(actionSheetAsin, releases, readAsins, readGroupKeys) {
+                val targetAsin = actionSheetAsin ?: return@remember null
+                releases.firstOrNull { rel ->
+                    rel.asin == targetAsin && !ReleaseRepository.isReleaseRead(rel, readAsins, readGroupKeys)
+                }
+            }
+            if (sheetRelease != null) {
+                ReleaseActionSheet(
+                    rel = sheetRelease,
+                    trackedItems = trackedItems,
+                    pinnedAsins = pinnedAsins,
+                    pinnedGroupKeys = pinnedGroupKeys,
+                    onTogglePin = {
+                        scope.launch {
+                            val nowPinned = repo.togglePinRelease(sheetRelease)
+                            val titleUp = sheetRelease.title.replace(marketingSubtitleRegex, "").trim().ifBlank { sheetRelease.title }.uppercase()
+                            postAsciiStatus(
+                                if (nowPinned) "* PINNED: $titleUp" else "UNPINNED: $titleUp",
+                                false
+                            )
+                        }
+                    },
+                    onQuickTrack = { type, value, thumbUrl, extId ->
+                        handleAddTracked(type, value, 0, thumbUrl, extId)
+                    },
+                    onOpenOrCopyMagnet = {
+                        val magnet = sheetRelease.abbMagnetUri
+                        if (magnet.startsWith("magnet:")) {
+                            val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                            clipboard.setPrimaryClip(ClipData.newPlainText("ABB Magnet URI", magnet))
+                            runCatching {
+                                context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(magnet)))
+                            }.onFailure {
+                                postAsciiStatus("OK: MAGNET URI COPIED TO CLIPBOARD", false)
+                            }
+                        }
+                        actionSheetAsin = null
+                    },
+                    onCopyRelease = {
+                        val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                        val seriesPart = if (sheetRelease.seriesTitle.isNotBlank()) {
+                            " (${sheetRelease.seriesTitle}${sheetRelease.seriesSequence?.let { " #$it" }.orEmpty()})"
+                        } else ""
+                        val summary = "${sheetRelease.title}$seriesPart | By ${sheetRelease.authors} | Narrated by ${sheetRelease.narrators} | Release: ${sheetRelease.releaseDateIso}"
+                        clipboard.setPrimaryClip(ClipData.newPlainText("Audiobook Release", summary))
+                        postAsciiStatus("OK: RELEASE DETAILS COPIED TO CLIPBOARD", false)
+                        actionSheetAsin = null
+                    },
+                    onExportCalendar = {
+                        val date = runCatching { LocalDate.parse(sheetRelease.releaseDateIso) }.getOrNull()
+                        if (date != null) {
+                            val startMs = date.atStartOfDay(ZoneOffset.UTC).toInstant().toEpochMilli()
+                            val calIntent = Intent(Intent.ACTION_INSERT).apply {
+                                data = CalendarContract.Events.CONTENT_URI
+                                putExtra(CalendarContract.Events.TITLE, "Audiobook Release: ${sheetRelease.title}")
+                                putExtra(
+                                    CalendarContract.Events.DESCRIPTION,
+                                    "By ${sheetRelease.authors} | Narrated by ${sheetRelease.narrators} | Series: ${sheetRelease.seriesTitle} | ASIN: ${sheetRelease.asin}"
+                                )
+                                putExtra(CalendarContract.EXTRA_EVENT_ALL_DAY, true)
+                                putExtra(CalendarContract.EXTRA_EVENT_BEGIN_TIME, startMs)
+                                putExtra(CalendarContract.EXTRA_EVENT_END_TIME, startMs + 86_400_000L)
+                            }
+                            runCatching { context.startActivity(calIntent) }.onFailure {
+                                postAsciiStatus("WARN: NO CALENDAR APP FOUND", true)
+                            }
+                        }
+                        actionSheetAsin = null
+                    },
+                    onMuteBook = {
+                        actionSheetAsin = null
+                        scope.launch {
+                            repo.muteBook(sheetRelease.asin, sheetRelease.title)
+                            postAsciiStatus("DND MUTED BOOK: ${sheetRelease.title.uppercase()}", true)
+                        }
+                    },
+                    onMuteSeries = {
+                        actionSheetAsin = null
+                        scope.launch {
+                            repo.muteSeries(sheetRelease.seriesTitle, sheetRelease.seriesTitle)
+                            postAsciiStatus("DND MUTED SERIES: ${sheetRelease.seriesTitle.uppercase()}", true)
+                        }
+                    },
+                    onDismiss = { actionSheetAsin = null }
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun ReleaseActionSheet(
+    rel: ReleaseEntity,
+    trackedItems: List<TrackedItemEntity>,
+    pinnedAsins: Set<String>,
+    pinnedGroupKeys: Set<String>,
+    onTogglePin: () -> Unit,
+    onQuickTrack: (TrackType, String, String, String?) -> Unit,
+    onOpenOrCopyMagnet: () -> Unit,
+    onCopyRelease: () -> Unit,
+    onExportCalendar: () -> Unit,
+    onMuteBook: () -> Unit,
+    onMuteSeries: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    val palette = LocalPtsPalette.current
+    val cleanedTitle = remember(rel.title) {
+        rel.title.replace(marketingSubtitleRegex, "").trim().ifBlank { rel.title }.uppercase()
+    }
+    val isPinned = remember(rel, pinnedAsins, pinnedGroupKeys) {
+        ReleaseRepository.isReleasePinned(rel, pinnedAsins, pinnedGroupKeys)
+    }
+
+    val primaryAuthor = remember(rel.authors) {
+        rel.authors.split(",").firstOrNull()?.trim().orEmpty()
+    }
+    val primaryNarrator = remember(rel.narrators) {
+        rel.narrators.split(",").firstOrNull()?.trim()
+            ?.takeIf { !it.equals("TBA", ignoreCase = true) }.orEmpty()
+    }
+
+    val isSeriesTracked = remember(rel, trackedItems) {
+        rel.seriesTitle.isNotBlank() && trackedItems.any { s ->
+            s.type == TrackType.SERIES && (
+                (s.pinnedAsin.isNotBlank() && s.pinnedAsin.equals(rel.seriesAsin, ignoreCase = true)) ||
+                    rel.seriesTitle.equals(s.queryValue, ignoreCase = true) ||
+                    (s.pinnedAsin.isBlank() && rel.seriesTitle.contains(s.queryValue, ignoreCase = true))
+                )
+        }
+    }
+    val isAuthorTracked = remember(primaryAuthor, trackedItems) {
+        primaryAuthor.isNotBlank() && trackedItems.any { a ->
+            a.type == TrackType.AUTHOR && AudibleApiClient.isExactAuthorNameMatch(a.queryValue, primaryAuthor)
+        }
+    }
+    val isNarratorTracked = remember(primaryNarrator, trackedItems) {
+        primaryNarrator.isNotBlank() && trackedItems.any { n ->
+            n.type == TrackType.NARRATOR && AudibleApiClient.isExactAuthorNameMatch(n.queryValue, primaryNarrator)
+        }
+    }
+
+    Box(
+        contentAlignment = Alignment.BottomCenter,
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color.Black.copy(alpha = 0.68f))
+            .clickable(
+                interactionSource = remember { MutableInteractionSource() },
+                indication = null,
+                onClick = onDismiss
+            )
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable(
+                    interactionSource = remember { MutableInteractionSource() },
+                    indication = null,
+                    onClick = {}
+                )
+                .padding(horizontal = 12.dp, vertical = 12.dp)
+                .verticalScroll(rememberScrollState())
+        ) {
+            AsciiBox(
+                headerLabel = cleanedTitle,
+                borderColor = palette.cyan,
+                headerColor = palette.cyan
+            ) {
+                AsciiToggleRow(
+                    label = "Pin Release",
+                    checked = isPinned,
+                    onToggle = onTogglePin
+                )
+
+                if (rel.seriesTitle.isNotBlank()) {
+                    AsciiActionRow(
+                        label = "Follow Series: ${rel.seriesTitle}",
+                        token = if (isSeriesTracked) "[x]" else "[+]",
+                        labelColor = palette.foreground,
+                        tokenColor = if (isSeriesTracked) palette.green else palette.purple,
+                        enabled = !isSeriesTracked,
+                        onClick = {
+                            val ext = "${rel.seriesAsin}|$primaryAuthor"
+                            onQuickTrack(TrackType.SERIES, rel.seriesTitle, rel.coverUrl, ext)
+                        }
+                    )
+                }
+
+                if (primaryAuthor.isNotBlank()) {
+                    AsciiActionRow(
+                        label = "Follow Author: $primaryAuthor",
+                        token = if (isAuthorTracked) "[x]" else "[+]",
+                        labelColor = palette.foreground,
+                        tokenColor = if (isAuthorTracked) palette.green else palette.yellow,
+                        enabled = !isAuthorTracked,
+                        onClick = {
+                            onQuickTrack(TrackType.AUTHOR, primaryAuthor, rel.coverUrl, null)
+                        }
+                    )
+                }
+
+                if (primaryNarrator.isNotBlank()) {
+                    AsciiActionRow(
+                        label = "Follow Narrator: $primaryNarrator",
+                        token = if (isNarratorTracked) "[x]" else "[+]",
+                        labelColor = palette.foreground,
+                        tokenColor = if (isNarratorTracked) palette.green else palette.orange,
+                        enabled = !isNarratorTracked,
+                        onClick = {
+                            onQuickTrack(TrackType.NARRATOR, primaryNarrator, rel.coverUrl, null)
+                        }
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(2.dp))
+                AsciiRule(pattern = "- ")
+                Spacer(modifier = Modifier.height(2.dp))
+
+                if (rel.abbMagnetUri.startsWith("magnet:")) {
+                    AsciiActionRow(
+                        label = "Open / Copy ABB Magnet",
+                        token = "[>]",
+                        labelColor = palette.green,
+                        tokenColor = palette.green,
+                        onClick = onOpenOrCopyMagnet
+                    )
+                }
+
+                AsciiActionRow(
+                    label = "Copy Release Details",
+                    token = "[>]",
+                    labelColor = palette.foreground,
+                    tokenColor = palette.cyan,
+                    onClick = onCopyRelease
+                )
+
+                if (rel.releaseDateIso != "TBA") {
+                    AsciiActionRow(
+                        label = "Export to Calendar",
+                        token = "[>]",
+                        labelColor = palette.foreground,
+                        tokenColor = palette.yellow,
+                        onClick = onExportCalendar
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(2.dp))
+                AsciiRule(pattern = "- ")
+                Spacer(modifier = Modifier.height(2.dp))
+
+                AsciiActionRow(
+                    label = "Mute Book (DND)",
+                    token = "[!]",
+                    labelColor = palette.red,
+                    tokenColor = palette.red,
+                    hapticType = HapticFeedbackType.LongPress,
+                    onClick = onMuteBook
+                )
+
+                if (rel.seriesTitle.isNotBlank()) {
+                    AsciiActionRow(
+                        label = "Mute Series (DND)",
+                        token = "[!]",
+                        labelColor = palette.red,
+                        tokenColor = palette.red,
+                        hapticType = HapticFeedbackType.LongPress,
+                        onClick = onMuteSeries
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(4.dp))
+                AsciiRule(pattern = "- ")
+                Spacer(modifier = Modifier.height(2.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.End
+                ) {
+                    BracketButton(
+                        label = "CLOSE x",
+                        color = palette.comment,
+                        onClick = onDismiss
+                    )
+                }
+            }
         }
     }
 }
@@ -1264,7 +1561,8 @@ private fun UpcomingFeedView(
     onMarkRead: (ReleaseCardUiModel) -> Unit = {},
     onUndoMarkRead: (MarkReadOutcome) -> Unit = {},
     onUnmarkReadBook: (ReadBookEntity) -> Unit = {},
-    onTogglePin: (ReleaseCardUiModel) -> Unit = {}
+    onTogglePin: (ReleaseCardUiModel) -> Unit = {},
+    onOpenActionMenu: (ReleaseCardUiModel) -> Unit = {}
 ) {
     val palette = LocalPtsPalette.current
     val todayIso = remember(today) { today.toString() }
@@ -1880,6 +2178,7 @@ private fun UpcomingFeedView(
                     onMarkSeriesSeqRead = onMarkSeriesSeqRead,
                     onMarkRead = { onMarkRead(card) },
                     onTogglePin = { onTogglePin(card) },
+                    onOpenActionMenu = { onOpenActionMenu(card) },
                     onAutoCheckAbb = { cardItem ->
                         if (!cardItem.entity.abbAvailable && !cardItem.isFutureOrTba) {
                             onAutoCheckAbb(cardItem)
@@ -1921,6 +2220,7 @@ private fun UpcomingFeedView(
                         onMarkSeriesSeqRead = onMarkSeriesSeqRead,
                         onMarkRead = { onMarkRead(card) },
                         onTogglePin = { onTogglePin(card) },
+                        onOpenActionMenu = { onOpenActionMenu(card) },
                         onAutoCheckAbb = { cardItem ->
                             if (!cardItem.entity.abbAvailable && !cardItem.isFutureOrTba) {
                                 onAutoCheckAbb(cardItem)
@@ -1933,7 +2233,6 @@ private fun UpcomingFeedView(
     }
 }
 
-@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun ReleaseScorecard(
     card: ReleaseCardUiModel,
@@ -1952,6 +2251,7 @@ private fun ReleaseScorecard(
     onMarkSeriesSeqRead: (TrackedItemEntity, Int) -> Unit,
     onMarkRead: () -> Unit = {},
     onTogglePin: () -> Unit = {},
+    onOpenActionMenu: () -> Unit = {},
     onAutoCheckAbb: (ReleaseCardUiModel) -> Unit = {}
 ) {
     val palette = LocalPtsPalette.current
@@ -2115,68 +2415,6 @@ private fun ReleaseScorecard(
             AsciiRule(pattern = "- ")
             Spacer(modifier = Modifier.height(2.dp))
 
-            FlowRow(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                BracketButton(
-                    label = "Mark Read",
-                    color = palette.green,
-                    onClick = onMarkRead
-                )
-                BracketButton(
-                    label = if (card.isPinned) "Pinned" else "* Pin",
-                    active = card.isPinned,
-                    color = palette.yellow,
-                    onClick = onTogglePin
-                )
-                if (rel.seriesTitle.isNotBlank()) {
-                    BracketButton(
-                        label = if (card.isSeriesAlreadyTracked) "[x] Series" else "[+ Series]",
-                        active = card.isSeriesAlreadyTracked,
-                        color = palette.purple,
-                        onClick = {
-                            if (!card.isSeriesAlreadyTracked) {
-                                val ext = "${rel.seriesAsin}|${card.primaryAuthor}"
-                                onQuickTrack(TrackType.SERIES, rel.seriesTitle, rel.coverUrl, ext)
-                            }
-                        }
-                    )
-                }
-                if (card.primaryAuthor.isNotBlank()) {
-                    BracketButton(
-                        label = if (card.isPrimaryAuthorAlreadyTracked) "[x] Author" else "[+ Author]",
-                        active = card.isPrimaryAuthorAlreadyTracked,
-                        color = palette.yellow,
-                        onClick = {
-                            if (!card.isPrimaryAuthorAlreadyTracked) {
-                                onQuickTrack(TrackType.AUTHOR, card.primaryAuthor, rel.coverUrl, null)
-                            }
-                        }
-                    )
-                }
-                if (card.primaryNarrator.isNotBlank()) {
-                    BracketButton(
-                        label = if (card.isPrimaryNarratorAlreadyTracked) "[x] Narrator" else "[+ Narrator]",
-                        active = card.isPrimaryNarratorAlreadyTracked,
-                        color = palette.orange,
-                        onClick = {
-                            if (!card.isPrimaryNarratorAlreadyTracked) {
-                                onQuickTrack(TrackType.NARRATOR, card.primaryNarrator, rel.coverUrl, null)
-                            }
-                        }
-                    )
-                }
-                if (card.matchedStandaloneBookItem != null && !card.isFutureOrTba) {
-                    BracketButton(
-                        label = "[x] Archive Book",
-                        color = palette.green,
-                        onClick = { onArchiveTrackedBook(card.matchedStandaloneBookItem) }
-                    )
-                }
-            }
-
-            Spacer(modifier = Modifier.height(2.dp))
             if (isCheckingAbb) {
                 MonoText(
                     text = "[ $abbSpinner CHECKING AUDIOBOOKBAY... ]",
@@ -2186,54 +2424,33 @@ private fun ReleaseScorecard(
                 )
                 Spacer(modifier = Modifier.height(2.dp))
             }
-            FlowRow(
+
+            Row(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
             ) {
                 BracketButton(
-                    label = "Audible",
+                    label = "READ",
                     color = palette.green,
+                    onClick = onMarkRead
+                )
+                BracketButton(
+                    label = "AUDIBLE",
+                    color = palette.cyan,
                     onClick = onOpenAudibleSearch
                 )
                 BracketButton(
-                    label = if (rel.abbAvailable) "ABB READY" else "ABB",
+                    label = "ABB",
                     active = rel.abbAvailable,
                     color = if (rel.abbAvailable) palette.green else palette.orange,
                     onClick = onOpenAudioBookBay
                 )
-                if (rel.abbMagnetUri.startsWith("magnet:")) {
-                    BracketButton(
-                        label = "Magnet",
-                        color = palette.green,
-                        onClick = onOpenOrCopyMagnet
-                    )
-                }
                 BracketButton(
-                    label = "Copy",
-                    color = palette.cyan,
-                    onClick = onCopyRelease
+                    label = "MENU",
+                    color = palette.purple,
+                    onClick = onOpenActionMenu
                 )
-                if (rel.releaseDateIso != "TBA") {
-                    BracketButton(
-                        label = "+ Cal",
-                        color = palette.yellow,
-                        onClick = onExportCalendar
-                    )
-                }
-                BracketButton(
-                    label = "DND Book",
-                    color = palette.red,
-                    hapticType = HapticFeedbackType.LongPress,
-                    onClick = onMuteBook
-                )
-                if (rel.seriesTitle.isNotBlank()) {
-                    BracketButton(
-                        label = "DND Series",
-                        color = palette.red,
-                        hapticType = HapticFeedbackType.LongPress,
-                        onClick = onMuteSeries
-                    )
-                }
             }
         }
     }

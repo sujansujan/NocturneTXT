@@ -515,6 +515,91 @@ fun AsciiToggleRow(
 }
 
 /**
+ * Full-width dotted-leader interactive action row for ASCII command sheets:
+ * `Follow Series: The Last Horizon .......... [+]`
+ * `Copy Release Details ..................... [>]`
+ */
+@Composable
+fun AsciiActionRow(
+    label: String,
+    token: String = "[>]",
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+    labelColor: Color = LocalPtsPalette.current.foreground,
+    tokenColor: Color = LocalPtsPalette.current.cyan,
+    enabled: Boolean = true,
+    hapticType: HapticFeedbackType? = HapticFeedbackType.TextHandleMove
+) {
+    val palette = LocalPtsPalette.current
+    val haptic = LocalHapticFeedback.current
+    val interactionSource = remember { MutableInteractionSource() }
+    val isPressed by interactionSource.collectIsPressedAsState()
+
+    val rowBg = if (enabled && isPressed) palette.surfaceLine.copy(alpha = 0.55f) else Color.Transparent
+
+    BoxWithConstraints(
+        contentAlignment = Alignment.CenterStart,
+        modifier = modifier
+            .fillMaxWidth()
+            .defaultMinSize(minHeight = 42.dp)
+            .background(rowBg)
+            .clickable(
+                enabled = enabled,
+                interactionSource = interactionSource,
+                indication = null,
+                role = Role.Button,
+                onClick = {
+                    if (hapticType != null) {
+                        haptic.performHapticFeedback(hapticType)
+                    }
+                    onClick()
+                }
+            )
+            .padding(vertical = 3.dp)
+            .clearAndSetSemantics { contentDescription = label }
+    ) {
+        val cols = rememberAsciiCols(fontSizeSp = 12, bold = false)
+        val cleanLabel = label.trim()
+        val cleanToken = token.trim()
+        val maxLabelLen = (cols - cleanToken.length - 4).coerceAtLeast(6)
+        val displayLabel = if (cleanLabel.length > maxLabelLen) {
+            cleanLabel.take((maxLabelLen - 2).coerceAtLeast(4)) + ".."
+        } else {
+            cleanLabel
+        }
+        val dotCount = (cols - displayLabel.length - cleanToken.length - 2).coerceAtLeast(2)
+        val dots = ".".repeat(dotCount)
+
+        val annotated = buildAnnotatedString {
+            withStyle(
+                SpanStyle(
+                    color = if (enabled) labelColor else palette.comment,
+                    fontWeight = FontWeight.Normal
+                )
+            ) {
+                append(displayLabel)
+            }
+            withStyle(SpanStyle(color = palette.comment.copy(alpha = 0.38f), fontWeight = FontWeight.Normal)) {
+                append(" $dots ")
+            }
+            withStyle(SpanStyle(color = tokenColor, fontWeight = FontWeight.Bold)) {
+                append(cleanToken)
+            }
+        }
+
+        Text(
+            text = annotated,
+            fontFamily = FontFamily.Monospace,
+            fontSize = 12.sp,
+            softWrap = false,
+            maxLines = 1,
+            overflow = TextOverflow.Clip,
+            style = TextStyle(fontFeatureSettings = MONO_FONT_FEATURES)
+        )
+    }
+}
+
+/**
  * Interactive ASCII Radio Option (`(*) LABEL` / `( ) LABEL`) with inverse press state.
  */
 @Composable
