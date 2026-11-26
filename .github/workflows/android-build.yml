@@ -32,6 +32,14 @@ jobs:
           gradle-version: '8.7'
           cache-disabled: true
 
+      - name: Restore Persistent Signing Keystore
+        if: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' }}
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          mkdir -p "$HOME/.android"
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$HOME/.android/debug.keystore"
+
       - name: Build Optimized Release and Debug APK
         run: gradle clean assembleRelease assembleDebug --no-daemon --no-build-cache
 
